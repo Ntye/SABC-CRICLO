@@ -232,26 +232,12 @@ authentication. Before registering a server you must run the **bootstrap script*
 once — this creates the `ansible` user, installs the platform's public key, and grants
 passwordless sudo. No manual SSH key copying needed.
 
-### Option A — Server can reach the platform (online)
-
 Open the **Add Server** page. Copy the one-liner and run it on the target server as root:
 
 ```bash
 curl -sSLk https://<platform-ip>:8443/api/nodes/bootstrap | sudo bash
 ```
 
-The script is served unauthenticated (it only contains the public key, which is not secret).
-
-### Option B — Airgap (no network from server to platform)
-
-1. Click **Download setup-node.sh** on the Add Server page.
-   The platform's public key is embedded in the script at download time.
-2. Transfer the script to the target server (USB, SCP, etc.).
-3. On the target server:
-
-```bash
-sudo bash setup-node.sh
-```
 
 ### Register the server
 
