@@ -1,0 +1,743 @@
+---
+# Installs Puppet Server on the target node.
+#
+# Airgap modes (checked in order, first match wins):
+#   1. TARBALL  — puppet-enterprise*.tar.gz / *.tar.tar / *.tar
+#                 in packages/puppet-master/; runs the PE silent installer.
+#   2. PACKAGES — puppetserver*.deb or puppetserver*.rpm in packages/puppet-master/
+#                 Uploaded and installed with apt/yum.
+#                 Also looks for openjdk*.deb/rpm for the Java dependency.
+#                 Optional: puppet*-release*.deb/rpm installs the repo package
+#                 locally instead of downloading it (for partially-connected envs).
+#   3. ONLINE   — no local files found; downloads repo + packages from internet.
+#
+- name: Install Puppet Server
+  hosts: target
+  become: yes
+  gather_facts: no
+
+  vars:
+    puppet_version: "8"
+    puppet_server_port: 8140
+    puppet_server_memory: "512m"
+    # PE console admin password — override via extra_vars: pe_console_password=MySecurePass1!
+    # Must be ≥12 chars and contain upper, lower, digit, and special character.
+    # --extra-vars @file.json (highest Ansible precedence) overrides this default.
+    pe_console_password: "SABCPuppet2025!"
+    # packages_dir is injected by AnsibleAdapter (absolute path to backend/packages/)
+    puppet_pkg_dir: "{{ packages_dir }}/puppet-master"
+    # Edition control (injected by the platform when switching editions):
+    #   ""           auto-detect from the artifacts present (legacy behaviour)
+    #   "enterprise" force Puppet Enterprise (requires a PE tarball)
+    #   "core"       force open-source Puppet Core (never uses the PE tarball)
+    puppet_edition: ""
+    # When true, cleanly remove the *opposite* edition before installing — this
+    # is what makes switching PE ⇄ Core work (the two cannot coexist).
+    purge_other_edition: false
+
+  # ── Bootstrap: ensure a MODERN Python (>=3.8) before gathering facts ───────
+  # Fresh/minimal cloud images may ship without python3 at all, OR with a
+  # version too old for modern Ansible — e.g. Amazon Linux 2 / RHEL 7 default
+  # to python3.6, which fails on "from __future__ import annotations" (needs
+  # >=3.7) and on ansible-core modules (need >=3.8). The raw module runs over
+  # plain SSH with NO Python dependency: use it to install/locate a suitable
+  # interpreter, then pin ansible_python_interpreter to it before setup runs.
+  pre_tasks:
+    - name: Bootstrap a suitable Python interpreter (raw SSH, no facts)
+      raw: |
+        # Echo the first python on PATH whose version is >= 3.8, else nothing
+        find_py() {
+          for p in python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python3; do
+            if command -v "$p" >/dev/null 2>&1; then
+              v=$("$p" -c 'import sys;print(sys.version_info[0]*100+sys.version_info[1])' 2>/dev/null || echo 0)
+              if [ "$v" -ge 308 ]; then command -v "$p"; return 0; fi
+            fi
+          done
+          return 1
+        }
+        if P=$(find_py); then echo "PYINTERP=$P"; exit 0; fi
+        echo "BOOTSTRAP: installing a modern python3 (>=3.8)" >&2
+        if command -v apt-get >/dev/null 2>&1; then
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y || true
+          apt-get install -y python3 || true
+          find_py >/dev/null 2>&1 || apt-get install -y python3.8 || true
+        elif command -v dnf >/dev/null 2>&1; then
+          dnf install -y python3 || true
+        elif command -v yum >/dev/null 2>&1; then
+          # Amazon Linux 2 / RHEL 7 / CentOS 7: default python3 is 3.6 — pull 3.8
+          yum install -y python38 \
+            || amazon-linux-extras install -y python3.8 \
+            || { amazon-linux-extras enable python3.8 && yum clean metadata && yum install -y python38; } \
+            || yum install -y python3 \
+            || true
+        elif command -v zypper >/dev/null 2>&1; then
+          zypper --non-interactive install python3 || true
+        fi
+        if P=$(find_py); then echo "PYINTERP=$P"; exit 0; fi
+        echo "BOOTSTRAP ERROR: could not provide python >= 3.8 on target" >&2
+        exit 1
+      become: yes
+      register: python_bootstrap
+      changed_when: "'installing a modern' in (python_bootstrap.stderr | default(''))"
+
+    - name: Pin ansible_python_interpreter to the bootstrapped interpreter
+      set_fact:
+        ansible_python_interpreter: "{{ python_bootstrap.stdout | regex_findall('PYINTERP=(\\S+)') | first }}"
+      when: python_bootstrap.stdout is search('PYINTERP=')
+
+    - name: Gather facts now that a suitable Python is available
+      setup:
+
+  tasks:
+    # ── Airgap detection ──────────────────────────────────────────────────────
+    # Accept .tar.gz (standard PE download), .tar.tar (double-extension artefact
+    # from some browsers/downloaders), and plain .tar (already-decompressed).
+    # tar auto-detects the actual compression regardless of file extension.
+    - name: Find PE installer tarball on controller
+      find:
+        paths: "{{ puppet_pkg_dir }}"
+        patterns:
+          - "puppet-enterprise*.tar.gz"
+          - "puppet-enterprise*.tar.tar"
+          - "puppet-enterprise*.tar"
+      register: pe_tarball
+      delegate_to: localhost
+      become: no
+      failed_when: false
+
+    - name: Find puppetserver .deb/.rpm packages on controller
+      find:
+        paths: "{{ puppet_pkg_dir }}"
+        patterns: ["puppetserver*.deb", "puppetserver*.rpm"]
+      register: puppet_offline_pkgs
+      delegate_to: localhost
+      become: no
+      failed_when: false
+
+    - name: Find Java packages on controller
+      find:
+        paths: "{{ puppet_pkg_dir }}"
+        patterns: ["openjdk*.deb", "openjdk*.rpm", "java*.deb", "java*.rpm"]
+      register: java_offline_pkgs
+      delegate_to: localhost
+      become: no
+      failed_when: false
+
+    - name: Find local Puppet release package on controller
+      find:
+        paths: "{{ puppet_pkg_dir }}"
+        patterns: ["puppet*-release*.deb", "puppet*-release*.rpm"]
+      register: puppet_release_pkg
+      delegate_to: localhost
+      become: no
+      failed_when: false
+
+    - name: Fail early if forcing Enterprise without a PE tarball
+      fail:
+        msg: >-
+          puppet_edition=enterprise was requested but no Puppet Enterprise
+          installer tarball (puppet-enterprise-*.tar.gz) was found in
+          {{ puppet_pkg_dir }}. PE is commercial and cannot be installed from a
+          public package repo — download the PE tarball and place it there.
+      when: puppet_edition == 'enterprise' and pe_tarball.files | length == 0
+
+    - name: Determine installation mode
+      set_fact:
+        install_mode: >-
+          {{ 'tarball'   if puppet_edition == 'enterprise'
+             else 'packages' if (puppet_edition == 'core' and puppet_offline_pkgs.files | length > 0)
+             else 'online'   if puppet_edition == 'core'
+             else 'tarball'   if pe_tarball.files          | length > 0
+             else 'packages' if puppet_offline_pkgs.files | length > 0
+             else 'online' }}
+
+    - name: Report installation mode
+      debug:
+        msg: >-
+          Installation mode: {{ install_mode | upper }}
+          (edition={{ puppet_edition | default('auto') }},
+          purge_other={{ purge_other_edition }}, dir={{ puppet_pkg_dir }})
+
+    # ── Switch cleanup: remove Puppet Enterprise before installing Core ─────────
+    # PE installs pe-puppetserver/pe-* and its own CA under /opt/puppetlabs. When
+    # switching to open-source Puppet Core those must go first, or puppetserver
+    # and the PE services fight over ports 8140/8143 and the CA. The PE
+    # uninstaller is the supported way to tear PE down.
+    - name: Uninstall Puppet Enterprise before switching to Puppet Core
+      shell: |
+        set +e
+        # Stop PE services if present so the uninstaller/cleanup is unobstructed.
+        for svc in pe-puppetserver pe-puppetdb pe-console-services \
+                   pe-orchestration-services pe-nginx pe-postgresql; do
+          systemctl stop "$svc" 2>/dev/null
+        done
+        # Supported teardown: purge packages (-p) and databases (-d).
+        if [ -x /opt/puppetlabs/bin/puppet-enterprise-uninstaller ]; then
+          /opt/puppetlabs/bin/puppet-enterprise-uninstaller -y -p -d
+        fi
+        exit 0
+      args:
+        executable: /bin/bash
+      register: pe_uninstall
+      changed_when: "'Uninstalling' in (pe_uninstall.stdout | default(''))"
+      when:
+        - install_mode != 'tarball'
+        - purge_other_edition | bool
+      ignore_errors: yes
+
+    # ── PREFLIGHT (resources — warn only, never block) ────────────────────────
+    # Puppet Enterprise (tarball) realistically wants ~6 GB+ RAM; open-source
+    # puppetserver runs in ~2.5 GB. Under-spec boxes install but may OOM/crash.
+    - name: Preflight — warn on low memory
+      debug:
+        msg: >-
+          WARNING: {{ ansible_fqdn }} has {{ ansible_memtotal_mb }} MB RAM.
+          {{ 'Puppet Enterprise recommends 6144 MB+' if install_mode == 'tarball'
+             else 'puppetserver recommends 2560 MB+' }} — installation may be
+          slow or unstable below this. Proceeding anyway.
+      when: >-
+        (install_mode == 'tarball' and ansible_memtotal_mb < 6144)
+        or (install_mode != 'tarball' and ansible_memtotal_mb < 2560)
+
+    - name: Preflight — check free disk on /opt
+      shell: df -BG --output=avail /opt | tail -1 | tr -d 'G '
+      register: opt_free_gb
+      changed_when: false
+      failed_when: false
+
+    - name: Preflight — warn on low disk
+      debug:
+        msg: >-
+          WARNING: only {{ opt_free_gb.stdout | trim }} GB free on /opt.
+          {{ 'Puppet Enterprise needs ~20 GB' if install_mode == 'tarball'
+             else 'puppetserver needs a few GB' }}. Proceeding anyway.
+      when:
+        - opt_free_gb.stdout | trim | length > 0
+        - (opt_free_gb.stdout | trim | int) < (20 if install_mode == 'tarball' else 5)
+
+    # ── Provision swap for a memory-tight PE install ────────────────────────────
+    # PE's monolithic stack (puppetserver JVM + PostgreSQL + console/orchestration
+    # services + nginx) all start at once and peak at ~5-6 GB. On a box with
+    # < 8 GB RAM and no swap the kernel OOM-kills a service mid-install and the
+    # installer fails. A swapfile gives the install the headroom to finish.
+    # Idempotent (creates: /swapfile); only when forcing/using PE with tight RAM.
+    - name: Ensure swap headroom for PE on memory-tight hosts
+      when:
+        - install_mode == 'tarball'
+        - (ansible_memtotal_mb | int) < 8192
+        - (ansible_swaptotal_mb | default(0) | int) < 2048
+      block:
+        - name: Allocate a 4 GiB swapfile
+          command: dd if=/dev/zero of=/swapfile bs=1M count=4096
+          args:
+            creates: /swapfile
+
+        - name: Secure the swapfile
+          file:
+            path: /swapfile
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Format the swapfile
+          command: mkswap /swapfile
+          register: _mkswap
+          changed_when: "'Setting up swapspace' in (_mkswap.stdout | default(''))"
+          failed_when:
+            - _mkswap.rc != 0
+            - "'exists' not in (_mkswap.stderr | default(''))"
+
+        - name: Enable the swapfile
+          command: swapon /swapfile
+          register: _swapon
+          changed_when: _swapon.rc == 0
+          failed_when:
+            - _swapon.rc != 0
+            - "'already' not in (_swapon.stderr | default('') | lower)"
+
+        - name: Persist the swapfile in /etc/fstab
+          lineinfile:
+            path: /etc/fstab
+            line: "/swapfile none swap sw 0 0"
+            state: present
+
+        - name: Report swap enabled
+          debug:
+            msg: "Enabled a 4 GiB swapfile so the PE install has memory headroom on this {{ ansible_memtotal_mb }} MB host."
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # MODE 1 — TARBALL (Puppet Enterprise)
+    #
+    # Standard PE install flow:
+    #   1. Extract tarball to /opt  (tarball already contains all .deb packages)
+    #   2. Overwrite conf.d/pe.conf inside the extracted dir with our settings
+    #   3. Run ./puppet-enterprise-installer -c conf.d/pe.conf from that dir
+    #
+    # The tarball is NOT copied via the copy module first — unarchive handles
+    # the upload+extract in one step to avoid doubling disk usage.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Check free disk space (PE needs ~20 GB)
+      shell: df -BG /opt --output=avail | tail -1 | tr -d 'G '
+      register: free_gb
+      changed_when: false
+      when: install_mode == 'tarball'
+
+    - name: Warn if disk space is low
+      debug:
+        msg: "WARNING: only {{ free_gb.stdout }}GB free on /opt — PE needs ~20GB"
+      when: install_mode == 'tarball' and (free_gb.stdout | int) < 20
+
+    # PE ships pe-puppetserver and pe-java — both conflict with the open-source
+    # puppetserver/puppet-agent packages if those were left half-configured by a
+    # previous failed open-source install attempt.  Purge them first so dpkg has
+    # no pending state to trip over when the PE installer runs apt-get.
+    - name: Remove conflicting open-source Puppet packages before PE install
+      shell: |
+        # Settle any half-configured dpkg state first
+        dpkg --configure -a || true
+        # Purge open-source packages that conflict with PE equivalents
+        PKGS=""
+        dpkg -l puppetserver 2>/dev/null | grep -q '^[iuph]' && PKGS="$PKGS puppetserver"
+        dpkg -l puppet-agent  2>/dev/null | grep -q '^[iuph]' && PKGS="$PKGS puppet-agent"
+        dpkg -l 'puppet-module-*' 2>/dev/null | awk '/^\S/{print $2}' | while read p; do
+          dpkg -l "$p" 2>/dev/null | grep -q '^[iuph]' && PKGS="$PKGS $p"
+        done
+        if [ -n "$PKGS" ]; then
+          apt-get purge -y $PKGS || true
+          apt-get install -f -y || true
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: install_mode == 'tarball'
+
+    - name: Extract PE tarball to /opt (uploads + extracts in one step)
+      unarchive:
+        src: "{{ pe_tarball.files[0].path }}"
+        dest: /opt/
+        remote_src: no
+        # Strip any combination of .tar / .tar.gz / .tar.tar / .tar.bz2 / .tar.xz
+        # so the creates: guard works regardless of how the file was named.
+        creates: "/opt/{{ pe_tarball.files[0].path | basename | regex_replace('(\\.tar)+(\\.gz|\\.bz2|\\.xz)?$', '') }}"
+      when: install_mode == 'tarball'
+
+    - name: Locate extracted installer directory
+      shell: "ls -d /opt/puppet-enterprise-*/ | head -1 | tr -d '\\n'"
+      register: pe_dir
+      changed_when: false
+      when: install_mode == 'tarball'
+
+    # Fill in the pe.conf that ships inside the tarball (conf.d/pe.conf).
+    # We overwrite it entirely — the shipped file is a template with comments,
+    # these are the only two fields required for a monolithic primary install.
+    - name: Write pe.conf (overwrite template inside installer dir)
+      copy:
+        dest: "{{ pe_dir.stdout }}conf.d/pe.conf"
+        mode: '0600'
+        content: |
+          {
+            "console_admin_password": "{{ pe_console_password }}",
+            "puppet_enterprise::puppet_master_host": "{{ ansible_fqdn }}"
+          }
+      when: install_mode == 'tarball'
+
+    - name: Print PE console password to job log (save this)
+      debug:
+        msg: >-
+          PE console admin password: {{ pe_console_password }}
+          — log in at https://{{ ansible_fqdn }} after install completes
+      when: install_mode == 'tarball'
+
+    # Skip the full installer when PE services are already running so re-runs
+    # are fast and idempotent.
+    - name: Check if pe-puppetserver service is already running
+      command: systemctl is-active pe-puppetserver
+      register: pe_running
+      changed_when: false
+      failed_when: false
+      when: install_mode == 'tarball'
+
+    # PE installation takes 30-90 minutes depending on instance size.
+    # async/poll launches the installer in the background and polls every 60 s
+    # so Ansible never holds a blocking SSH connection for the full duration.
+    # async: 9000 = 2.5 h ceiling — adjust up if running on a very slow instance.
+    - name: Install Puppet Enterprise (surface the real error on failure)
+      when: install_mode == 'tarball' and (pe_running.rc | default(1)) != 0
+      block:
+        - name: Run PE installer (this can take up to 90 minutes)
+          shell: |
+            cd "{{ pe_dir.stdout }}"
+            ./puppet-enterprise-installer -c conf.d/pe.conf 2>&1 | \
+              tee /var/log/puppetlabs/installer/pe-install-ansible.log
+          register: pe_install
+          async: 9000
+          poll: 60
+
+        - name: Show final PE installer output
+          debug:
+            msg: "{{ pe_install.stdout_lines[-30:] | default([]) }}"
+      rescue:
+        # The async installer failed. Read the log it tee'd so the operator sees
+        # the ACTUAL error instead of a generic "non-zero return code".
+        - name: Read the tail of the PE installer log
+          shell: tail -n 80 /var/log/puppetlabs/installer/pe-install-ansible.log 2>/dev/null || true
+          register: pe_log_tail
+          changed_when: false
+
+        - name: Fail with the real PE installer error
+          fail:
+            msg: |
+              Puppet Enterprise installation FAILED.
+              Most common causes: insufficient RAM (PE monolithic needs ~8 GB;
+              2-4 GB instances OOM mid-install) or disk (~20 GB free on /opt), or a
+              transient package/download error. Re-run on a larger instance, or use
+              Puppet Core (Edition → Switch) which runs in ~2.5 GB.
+
+              ── Last lines of the installer log ──
+              {{ pe_log_tail.stdout | default('(installer log unavailable)') }}
+
+    # ── Post-install: verify / recover console password ───────────────────────
+    # Runs on every invocation (fresh install, re-run, or already-installed).
+    # Three outcomes handled:
+    #   1. Login works with configured password       → report OK
+    #   2. Login fails (401) or lock file absent      → set password, report OK
+    #   3. Password set previously by other means     → report installed & operational
+
+    - name: Check console password lock file
+      stat:
+        path: /opt/puppetlabs/server/data/console_admin_password_lock
+      register: pe_pw_lock
+      when: install_mode == 'tarball'
+
+    - name: Test PE console login with configured password
+      uri:
+        url: "https://localhost:4433/rbac-api/v1/auth/token"
+        method: POST
+        body_format: json
+        body:
+          login: "admin"
+          password: "{{ pe_console_password }}"
+          lifetime: "1m"
+        validate_certs: no
+        status_code: [200, 201, 400, 401, 403, 404]
+      register: pe_login_test
+      ignore_errors: yes
+      when: install_mode == 'tarball'
+
+    - name: Configure console password (lock absent or password rejected)
+      shell: >-
+        /opt/puppetlabs/bin/puppet infrastructure console_password
+        --password '{{ pe_console_password }}'
+      register: pe_pw_set
+      when: >
+        install_mode == 'tarball'
+        and (
+          not pe_pw_lock.stat.exists
+          or (pe_login_test.status is defined and pe_login_test.status == 401)
+        )
+      ignore_errors: yes
+
+    - name: PE console status
+      debug:
+        msg: >-
+          {%- if pe_login_test.status is defined and pe_login_test.status in [200, 201] -%}
+          Puppet Enterprise installed and operational — console login verified at https://{{ ansible_fqdn }}
+          {%- elif pe_pw_set is defined and pe_pw_set.rc is defined and pe_pw_set.rc == 0 -%}
+          Puppet Enterprise installed and operational — console password configured at https://{{ ansible_fqdn }} (admin / {{ pe_console_password }})
+          {%- elif pe_pw_lock.stat.exists -%}
+          Puppet Enterprise installed and operational — console at https://{{ ansible_fqdn }} (password was previously configured)
+          {%- else -%}
+          Puppet Enterprise installed and operational — console at https://{{ ansible_fqdn }}
+          {%- endif -%}
+      when: install_mode == 'tarball'
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # MODE 2 — PACKAGES (.deb / .rpm)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Java (Debian, packages mode) ────────────────────────────────────────────
+    - name: Upload Java packages to node (packages mode, Debian)
+      copy:
+        src: "{{ item.path }}"
+        dest: "/tmp/{{ item.path | basename }}"
+      loop: "{{ java_offline_pkgs.files | default([]) | selectattr('path', 'search', '\\.deb$') | list }}"
+      when: install_mode == 'packages' and ansible_os_family == 'Debian'
+
+    - name: Install Java from local .deb
+      apt:
+        deb: "/tmp/{{ item.path | basename }}"
+      loop: "{{ java_offline_pkgs.files | default([]) | selectattr('path', 'search', '\\.deb$') | list }}"
+      when: install_mode == 'packages' and ansible_os_family == 'Debian'
+
+    # Java (RedHat, packages mode) ────────────────────────────────────────────
+    - name: Upload Java packages to node (packages mode, RedHat)
+      copy:
+        src: "{{ item.path }}"
+        dest: "/tmp/{{ item.path | basename }}"
+      loop: "{{ java_offline_pkgs.files | default([]) | selectattr('path', 'search', '\\.rpm$') | list }}"
+      when: install_mode == 'packages' and ansible_os_family == 'RedHat'
+
+    - name: Install Java from local .rpm
+      yum:
+        name: "/tmp/{{ item.path | basename }}"
+        state: present
+      loop: "{{ java_offline_pkgs.files | default([]) | selectattr('path', 'search', '\\.rpm$') | list }}"
+      when: install_mode == 'packages' and ansible_os_family == 'RedHat'
+
+    # puppetserver (Debian, packages mode) ────────────────────────────────────
+    - name: Upload puppetserver .deb to node
+      copy:
+        src: "{{ item.path }}"
+        dest: "/tmp/{{ item.path | basename }}"
+      loop: "{{ puppet_offline_pkgs.files | default([]) | selectattr('path', 'search', '\\.deb$') | list }}"
+      when: install_mode == 'packages' and ansible_os_family == 'Debian'
+
+    - name: Install puppetserver from local .deb
+      apt:
+        deb: "/tmp/{{ item.path | basename }}"
+      loop: "{{ puppet_offline_pkgs.files | default([]) | selectattr('path', 'search', '\\.deb$') | list }}"
+      when: install_mode == 'packages' and ansible_os_family == 'Debian'
+
+    # puppetserver (RedHat, packages mode) ────────────────────────────────────
+    - name: Upload puppetserver .rpm to node
+      copy:
+        src: "{{ item.path }}"
+        dest: "/tmp/{{ item.path | basename }}"
+      loop: "{{ puppet_offline_pkgs.files | default([]) | selectattr('path', 'search', '\\.rpm$') | list }}"
+      when: install_mode == 'packages' and ansible_os_family == 'RedHat'
+
+    - name: Install puppetserver from local .rpm
+      yum:
+        name: "/tmp/{{ item.path | basename }}"
+        state: present
+      loop: "{{ puppet_offline_pkgs.files | default([]) | selectattr('path', 'search', '\\.rpm$') | list }}"
+      when: install_mode == 'packages' and ansible_os_family == 'RedHat'
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # MODE 3 — ONLINE  (+ optional local release package)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Java (online) ───────────────────────────────────────────────────────────
+    - name: Install Java 17 (Debian, online)
+      apt:
+        name: openjdk-17-jre-headless
+        state: present
+        update_cache: yes
+      when: install_mode == 'online' and ansible_os_family == 'Debian'
+
+    - name: Install Java 17 (RedHat, online)
+      yum:
+        name: java-17-openjdk-headless
+        state: present
+      when: install_mode == 'online' and ansible_os_family == 'RedHat'
+
+    # Puppet repo setup — use local release pkg if present, else download ─────
+    - name: Upload local Puppet release .deb to node
+      copy:
+        src: "{{ puppet_release_pkg.files[0].path }}"
+        dest: /tmp/puppet-release.deb
+      when:
+        - install_mode == 'online'
+        - ansible_os_family == 'Debian'
+        - puppet_release_pkg.files | length > 0
+
+    - name: Download Puppet {{ puppet_version }} release package (Debian, no local copy)
+      get_url:
+        url: "https://apt.puppet.com/puppet{{ puppet_version }}-release-{{ ansible_distribution_release }}.deb"
+        dest: /tmp/puppet-release.deb
+        timeout: 60
+      when:
+        - install_mode == 'online'
+        - ansible_os_family == 'Debian'
+        - puppet_release_pkg.files | length == 0
+
+    - name: Install Puppet release package (Debian)
+      apt:
+        deb: /tmp/puppet-release.deb
+      when: install_mode == 'online' and ansible_os_family == 'Debian'
+
+    # Recover from a previously interrupted install: a half-configured
+    # puppetserver re-runs its postinst (dpkg-statoverride puppet:puppet) on
+    # every apt call and fails because puppet-agent never created the user.
+    # Settle any pending dpkg state before touching the packages again.
+    - name: Repair any half-configured dpkg state (Debian)
+      command: dpkg --configure -a
+      register: dpkg_repair
+      changed_when: dpkg_repair.stdout != ''
+      failed_when: false
+      when: install_mode == 'online' and ansible_os_family == 'Debian'
+
+    # Install puppet-agent FIRST: its postinst creates the `puppet` system
+    # user/group and /usr/share/puppet/modules that puppetserver's postinst
+    # depends on. Installing puppetserver alone (relying on the dependency)
+    # is what leaves the node wedged when configuration is interrupted.
+    - name: Install puppet-agent (Debian, online)
+      apt:
+        name: puppet-agent
+        state: present
+        update_cache: yes
+      when: install_mode == 'online' and ansible_os_family == 'Debian'
+
+    - name: Install puppetserver (Debian, online)
+      apt:
+        name: puppetserver
+        state: present
+        update_cache: yes
+      when: install_mode == 'online' and ansible_os_family == 'Debian'
+
+    - name: Upload local Puppet release .rpm to node
+      copy:
+        src: "{{ puppet_release_pkg.files[0].path }}"
+        dest: /tmp/puppet-release.rpm
+      when:
+        - install_mode == 'online'
+        - ansible_os_family == 'RedHat'
+        - puppet_release_pkg.files | length > 0
+
+    - name: Install local Puppet release .rpm (RedHat)
+      yum:
+        name: /tmp/puppet-release.rpm
+        state: present
+      when:
+        - install_mode == 'online'
+        - ansible_os_family == 'RedHat'
+        - puppet_release_pkg.files | length > 0
+
+    - name: Add Puppet {{ puppet_version }} repo from internet (RedHat, no local copy)
+      yum:
+        name: "https://yum.puppet.com/puppet{{ puppet_version }}-release-el-{{ ansible_distribution_major_version }}.noarch.rpm"
+        state: present
+      when:
+        - install_mode == 'online'
+        - ansible_os_family == 'RedHat'
+        - puppet_release_pkg.files | length == 0
+
+    # Install puppet-agent first so its scriptlets create the `puppet` user
+    # and module dirs before puppetserver is configured (see Debian note).
+    - name: Install puppet-agent (RedHat, online)
+      yum:
+        name: puppet-agent
+        state: present
+      when: install_mode == 'online' and ansible_os_family == 'RedHat'
+
+    - name: Install puppetserver (RedHat, online)
+      yum:
+        name: puppetserver
+        state: present
+      when: install_mode == 'online' and ansible_os_family == 'RedHat'
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CONFIGURE + START
+    # open-source (packages / online): configure JVM, puppet.conf, service
+    # PE tarball: installer already started everything; just open firewall ports
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Open-source only ──────────────────────────────────────────────────────
+    - name: Set JVM heap for puppetserver (Debian, open-source)
+      lineinfile:
+        path: /etc/default/puppetserver
+        regexp: '^JAVA_ARGS='
+        line: 'JAVA_ARGS="-Xms{{ puppet_server_memory }} -Xmx{{ puppet_server_memory }}"'
+        create: yes
+      when: install_mode != 'tarball' and ansible_os_family == 'Debian'
+
+    - name: Set JVM heap for puppetserver (RedHat, open-source)
+      lineinfile:
+        path: /etc/sysconfig/puppetserver
+        regexp: '^JAVA_ARGS='
+        line: 'JAVA_ARGS="-Xms{{ puppet_server_memory }} -Xmx{{ puppet_server_memory }}"'
+        create: yes
+      when: install_mode != 'tarball' and ansible_os_family == 'RedHat'
+
+    - name: Ensure puppet config directory exists (open-source)
+      file:
+        path: /etc/puppetlabs/puppet
+        state: directory
+        mode: '0755'
+      when: install_mode != 'tarball'
+
+    - name: Configure puppet.conf (open-source)
+      ini_file:
+        path: /etc/puppetlabs/puppet/puppet.conf
+        section: "{{ item.section }}"
+        option: "{{ item.key }}"
+        value: "{{ item.value }}"
+        create: yes
+      loop:
+        - { section: 'main',   key: 'certname',   value: '{{ ansible_fqdn }}' }
+        - { section: 'main',   key: 'server',      value: '{{ ansible_fqdn }}' }
+        - { section: 'main',   key: 'environment', value: 'production' }
+        - { section: 'main',   key: 'runinterval', value: '30m' }
+        - { section: 'server', key: 'vardir',      value: '/opt/puppetlabs/server/data/puppetserver' }
+        - { section: 'server', key: 'logdir',      value: '/var/log/puppetlabs/puppetserver' }
+        - { section: 'server', key: 'rundir',      value: '/var/run/puppetlabs/puppetserver' }
+      when: install_mode != 'tarball'
+
+    - name: Enable and start puppetserver (open-source)
+      service:
+        name: puppetserver
+        state: started
+        enabled: yes
+      when: install_mode != 'tarball'
+
+    # ── Firewall — open-source ports ──────────────────────────────────────────
+    - name: Allow port 8140 agent traffic (ufw, open-source)
+      ufw:
+        rule: allow
+        port: "8140"
+        proto: tcp
+      when: install_mode != 'tarball' and ansible_os_family == 'Debian'
+      ignore_errors: yes
+
+    - name: Allow port 8140 agent traffic (firewalld, open-source)
+      firewalld:
+        port: "8140/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      when: install_mode != 'tarball' and ansible_os_family == 'RedHat'
+      ignore_errors: yes
+
+    # ── Firewall — PE ports (ufw) ─────────────────────────────────────────────
+    # 8140 = agent comms, 8143 = orchestrator API, 8170 = Code Manager,
+    # 443/4433 = console HTTPS/RBAC
+    - name: Allow PE ports (ufw)
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: ["8140", "8143", "8170", "443", "4433"]
+      when: install_mode == 'tarball' and ansible_os_family == 'Debian'
+      ignore_errors: yes
+
+    - name: Allow PE ports (firewalld)
+      firewalld:
+        port: "{{ item }}/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop: ["8140", "8143", "8170", "443", "4433"]
+      when: install_mode == 'tarball' and ansible_os_family == 'RedHat'
+      ignore_errors: yes
+
+    # ── Verify ────────────────────────────────────────────────────────────────
+    - name: Wait for agent port 8140 to open
+      wait_for:
+        port: 8140
+        timeout: 120
+        delay: 5
+
+    - name: Verify puppet version
+      command: /opt/puppetlabs/bin/puppet --version
+      register: puppet_ver
+      changed_when: false
+
+    - name: Puppet Server ready
+      debug:
+        msg: >-
+          Puppet Server installed ({{ install_mode }}) —
+          version {{ puppet_ver.stdout }} —
+          {{ 'PE console: https://' + ansible_fqdn + ' (password in job log above)'
+             if install_mode == 'tarball'
+             else 'agent port :8140 open' }}

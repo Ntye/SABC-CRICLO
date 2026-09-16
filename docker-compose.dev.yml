@@ -1,0 +1,147 @@
+# Development compose — source code is volume-mounted so changes are live.
+#
+# Usage:
+#   First time (or after adding/removing a dependency):
+#     docker compose -f docker-compose.dev.yml up --build -d
+#
+#   After every 'git pull' (no rebuild needed):
+#     docker compose -f docker-compose.dev.yml up -d
+#     (backend auto-reloads on .py changes; frontend HMR updates the browser)
+#
+# For production / airgap deployment use docker-compose.yml instead.
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: sabc-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       "${POSTGRES_DB:-sabc}"
+      POSTGRES_USER:     "${POSTGRES_USER:-sabc}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-sabc-change-me}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - sabc-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sabc} -d ${POSTGRES_DB:-sabc}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Backend: FastAPI + Ansible ─────────────────────────────────────────────
+  backend:
+    build: ./backend          # built once — deps cached; rebuild only when
+    image: sabc-compliance-backend  # requirements.txt changes
+    container_name: sabc-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT:          "3000"
+      DB_PATH:       /app/data/platform.db
+      SSH_KEY_PATH:  /app/keys/ansible_id_rsa
+      ANSIBLE_DIR:   /app/ansible
+      PACKAGES_DIR:  /app/packages
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-sabc}:${POSTGRES_PASSWORD:-sabc-change-me}@postgres:5432/${POSTGRES_DB:-sabc}"
+      PLATFORM_PUBLIC_HOST: "${PLATFORM_PUBLIC_HOST:-}"
+      HTTPS_PORT:          "${HTTPS_PORT:-8443}"
+      TLS_CERTS_DIR:       /app/certs
+      # Offline AI assistant — reach the bundled Ollama service (started with the
+      # "ai" profile: docker compose -f docker-compose.dev.yml --profile ai up -d)
+      OLLAMA_URL:   "http://ollama:11434"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-llama3.2:3b}"
+    volumes:
+      - backend-data:/app/data
+      - backend-keys:/app/keys
+      - ./backend/packages:/app/packages
+      - frontend-certs:/app/certs
+      - ./backend/src:/app/src           # live — git pull reflects instantly
+      - ./backend/ansible:/app/ansible   # live — playbook edits take effect on next run
+      - ./backend/scan-profiles:/app/scan-profiles  # live — bundled scan profile, no rebuild needed
+      - ./backend/puppet:/app/puppet     # live — sabc_compliance Puppet module shipped to the master
+      - ./backend/detection-agent:/app/detection-agent:ro
+      # Committed referential seed (SABC Baseline) imported at first boot.
+      - ./backend/platform:/app/platform:ro  # live — committed referential seed (SABC Baseline)
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-3000}:3000"
+    networks:
+      - sabc-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command:
+      - uvicorn
+      - main:app
+      - --app-dir
+      - /app/src
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3000"
+      - --reload     # restarts automatically on any .py file change
+
+  # ── Frontend: Vite dev server (HTTPS) ──────────────────────────────────────
+  frontend:
+    image: node:20-alpine
+    container_name: sabc-frontend
+    working_dir: /app
+    environment:
+      TLS_SAN: "${PLATFORM_PUBLIC_HOST:-}"
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+      - frontend-certs:/certs
+    command: sh /app/dev-entrypoint.sh
+    ports:
+      - "${HTTPS_PORT:-8443}:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - sabc-net
+
+  # ── Ollama: offline AI assistant ─────────────────────────────────────────────
+  # Behind the "ai" profile so it only runs when you ask for it:
+  #   docker compose -f docker-compose.dev.yml --profile ai up -d
+  # Model weights live in the ollama-models volume. Populate it once with:
+  #   ./deploy/get-model.sh          # downloads llama3.2:3b to deploy/ollama-models.tar.gz
+  #   docker volume create ollama-models
+  #   docker run --rm -v ollama-models:/dest \
+  #     -v ./deploy/ollama-models.tar.gz:/src/m.tar.gz \
+  #     alpine tar -xzf /src/m.tar.gz -C /dest
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sabc-ollama
+    profiles: ["ai"]
+    restart: unless-stopped
+    networks:
+      - sabc-net
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  postgres-data:
+  backend-data:
+  backend-keys:
+  frontend-node-modules:
+  frontend-certs:
+  ollama-models:
+
+networks:
+  sabc-net:
+    driver: bridge

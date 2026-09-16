@@ -1,0 +1,1250 @@
+import { useEffect, useRef, useState } from 'react'
+import {
+  AlertTriangle, CheckCircle, ChevronDown, Cpu, KeyRound, Link, RefreshCw,
+  Search, Server, ShieldCheck, XCircle, GitBranch,
+} from 'lucide-react'
+import {
+  getInfrastructureStatus, installService, listNodes,
+  setPuppetMasterHost, setPuppetCredentials, jobWsUrl,
+  checkPuppetAgentPlatform,
+  getScanEngineStatus, installScanEngineOnController, verifyScanEngineAllNodes, verifyScanEngineNode,
+  checkNodeHealth, getPuppetEdition, switchPuppetEdition,
+} from '../lib/api.js'
+import { useToast } from '../context/ToastContext.jsx'
+import { useT } from '../context/LangContext.jsx'
+import { btn, btnSm, logLineClass } from '../lib/tw.js'
+import Spinner from '../components/common/Spinner.jsx'
+import Pagination from '../components/Pagination.jsx'
+import { usePagination } from '../hooks/usePagination.js'
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function utcDate(iso) {
+  if (!iso) return null
+  return new Date(/[Zz]|[+-]\d{2}:\d{2}$/.test(iso) ? iso : iso + 'Z')
+}
+
+function timeAgo(iso) {
+  if (!iso) return 'never'
+  const s = Math.floor((Date.now() - utcDate(iso)) / 1000)
+  if (s < 60)  return 'just now'
+  const m = Math.floor(s / 60)
+  if (m < 60)  return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24)  return `${h}h ago`
+  const d = Math.floor(h / 24)
+  if (d < 7)   return `${d}d ago`
+  return `${Math.floor(d / 7)}w ago`
+}
+
+function Pip({ ok, label }) {
+  if (ok === true)  return (
+    <span className="inline-flex items-center gap-1 text-[11px] text-green-700 font-medium">
+      <span className="w-1.5 h-1.5 rounded-full bg-green-500 flex-shrink-0" />
+      {label || 'Installed'}
+    </span>
+  )
+  if (ok === 'warn') return (
+    <span className="inline-flex items-center gap-1 text-[11px] text-amber-600 font-medium">
+      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0" />
+      {label || 'Unreachable'}
+    </span>
+  )
+  return (
+    <span className="inline-flex items-center gap-1 text-[11px] text-gray-400">
+      <span className="w-1.5 h-1.5 rounded-full bg-gray-300 flex-shrink-0" />
+      {label || 'Not installed'}
+    </span>
+  )
+}
+
+function StatusBadge({ configured, reachable, t }) {
+  if (!configured) return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-500">
+      {t('infra.notConfigured')}
+    </span>
+  )
+  if (reachable === null || reachable === undefined) return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-50 text-blue-600">
+      {t('infra.configured')}
+    </span>
+  )
+  if (reachable) return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-green-50 text-green-700">
+      <CheckCircle size={9} /> {t('infra.reachable')}
+    </span>
+  )
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-red-50 text-red-600">
+      <XCircle size={9} /> {t('infra.unreachable')}
+    </span>
+  )
+}
+
+// ── Log drawer (used for install jobs) ───────────────────────────────────────
+
+function LogDrawer({ job, onClose, t }) {
+  const [lines, setLines] = useState([])
+  const [done, setDone] = useState(false)
+  const bottomRef = useRef(null)
+
+  useEffect(() => {
+    if (!job) return
+    const ws = new WebSocket(jobWsUrl(job.id))
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data)
+      setLines((prev) => [...prev, msg])
+      if (msg.level === 'system') setDone(true)
+    }
+    ws.onerror = () => setDone(true)
+    ws.onclose  = () => setDone(true)
+    return () => ws.close()
+  }, [job?.id])
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [lines])
+
+  if (!job) return null
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 p-4" onClick={onClose}>
+      <div
+        className="w-full max-w-3xl bg-console-bg rounded-2xl overflow-hidden shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-3 border-b border-white/10">
+          <div className="flex items-center gap-2">
+            {!done && <Spinner size={12} className="text-console-accent" />}
+            {done && <CheckCircle size={13} className="text-green-400" />}
+            <span className="text-[12px] font-medium text-console-text">
+              Job {job.id.slice(0, 8)} — {done ? t('infra.jobCompleted') : t('infra.jobRunningState')}
+            </span>
+          </div>
+          <button onClick={onClose} className="text-console-muted hover:text-console-text text-[18px] leading-none">&times;</button>
+        </div>
+        <div className="h-80 overflow-y-auto p-4 font-mono text-[11px] leading-relaxed">
+          {lines.map((l, i) => (
+            <div key={i} className={logLineClass(l)}>{l.line || ' '}</div>
+          ))}
+          <div ref={bottomRef} />
+        </div>
+        {done && (
+          <div className="px-5 py-3 border-t border-white/10 flex justify-end">
+            <button onClick={onClose} className={btnSm(true)}>{t('common.close')}</button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Connect host form ─────────────────────────────────────────────────────────
+
+function ConnectForm({ service, onSave, onCancel, t }) {
+  const [host, setHost] = useState('')
+  const [saving, setSaving] = useState(false)
+  const toast = useToast()
+
+  async function handleSave() {
+    if (!host.trim()) return
+    setSaving(true)
+    try {
+      const result = await setPuppetMasterHost(host.trim())
+      toast(
+        result.reachable
+          ? t('infra.saveDone', { host: result.host, port: result.port })
+          : t('infra.saveWarning', { port: result.port }),
+        result.reachable ? 'success' : 'warning',
+      )
+      onSave()
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const label       = t('infra.connectToPuppet')
+  const placeholder = 'puppet.example.com'
+
+  return (
+    <div className="mt-4 p-4 bg-gray-50 rounded-xl border border-gray-200 space-y-3">
+      <p className="text-[11px] font-semibold text-gray-600 uppercase tracking-wider">{label}</p>
+      <div className="flex gap-2">
+        <input
+          autoFocus
+          value={host}
+          onChange={(e) => setHost(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && handleSave()}
+          placeholder={placeholder}
+          className="flex-1 px-3 py-2 text-[12px] font-mono border border-gray-200 rounded-lg outline-none focus:border-brand focus:ring-2 focus:ring-brand/15"
+        />
+        <button onClick={handleSave} disabled={saving || !host.trim()} className={btn(true)}>
+          {saving && <Spinner size={13} />}
+          {saving ? t('infra.saving') : t('common.save')}
+        </button>
+        <button onClick={onCancel} className={btn(false)}>{t('common.cancel')}</button>
+      </div>
+    </div>
+  )
+}
+
+// ── PE credentials form ───────────────────────────────────────────────────────
+
+function PuppetCredentialsForm({ onSave, onCancel, t }) {
+  const [user, setUser]     = useState('admin')
+  const [pass, setPass]     = useState('')
+  const [saving, setSaving] = useState(false)
+  const toast = useToast()
+
+  async function handleSave() {
+    if (!pass.trim()) return
+    setSaving(true)
+    try {
+      await setPuppetCredentials(user.trim() || 'admin', pass.trim())
+      toast(t('infra.credentialsSaved'), 'success')
+      onSave()
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="mt-4 p-4 bg-gray-50 rounded-xl border border-gray-200 space-y-3">
+      <p className="text-[11px] font-semibold text-gray-600 uppercase tracking-wider">
+        {t('infra.setPECredentials')}
+      </p>
+      <p className="text-[11px] text-gray-500">{t('infra.credentialsHint')}</p>
+      <div className="flex gap-2">
+        <input
+          value={user}
+          onChange={(e) => setUser(e.target.value)}
+          placeholder="admin"
+          className="w-28 px-3 py-2 text-[12px] font-mono border border-gray-200 rounded-lg outline-none focus:border-brand focus:ring-2 focus:ring-brand/15"
+        />
+        <input
+          autoFocus
+          type="password"
+          value={pass}
+          onChange={(e) => setPass(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && handleSave()}
+          placeholder={t('infra.pePassword')}
+          className="flex-1 px-3 py-2 text-[12px] font-mono border border-gray-200 rounded-lg outline-none focus:border-brand focus:ring-2 focus:ring-brand/15"
+        />
+        <button onClick={handleSave} disabled={saving || !pass.trim()} className={btn(true)}>
+          {saving && <Spinner size={13} />}
+          {saving ? t('infra.saving') : t('common.save')}
+        </button>
+        <button onClick={onCancel} className={btn(false)}>{t('common.cancel')}</button>
+      </div>
+    </div>
+  )
+}
+
+// ── Install modal (master services) ──────────────────────────────────────────
+
+function InstallModal({ service, nodes, onClose, onJobStarted, t }) {
+  const [selectedNode, setSelectedNode] = useState('')
+  const [starting, setStarting]         = useState(false)
+  const [platformCheck, setPlatformCheck]     = useState(null)
+  const [checkingPlatform, setCheckingPlatform] = useState(false)
+  const toast = useToast()
+
+  const serviceLabels = {
+    'puppet-master': t('infra.installPuppetMaster'),
+  }
+  const label = serviceLabels[service] || service
+
+  async function handleNodeChange(nodeId) {
+    setSelectedNode(nodeId)
+    setPlatformCheck(null)
+    if (!nodeId) return
+
+    setCheckingPlatform(true)
+    try {
+      const result = await checkPuppetAgentPlatform(nodeId)
+      setPlatformCheck(result)
+    } catch (_) {}
+    finally { setCheckingPlatform(false) }
+  }
+
+  async function handleStart() {
+    if (!selectedNode) return
+    setStarting(true)
+    try {
+      const job = await installService(service, selectedNode)
+      onJobStarted(job)
+      onClose()
+    } catch (err) {
+      toast(err.message, 'error')
+      setStarting(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+          <h3 className="text-[14px] font-semibold text-gray-900">{label}</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-[18px] leading-none">&times;</button>
+        </div>
+        <div className="px-5 py-4 space-y-4">
+          <p className="text-[12px] text-gray-500">
+            {t('infra.installDesc', { service: label })}
+          </p>
+          <div>
+            <label className="block text-[11px] font-medium text-gray-500 mb-1.5">{t('infra.targetNode')}</label>
+            <select
+              value={selectedNode}
+              onChange={(e) => handleNodeChange(e.target.value)}
+              className="w-full px-3 py-2 text-[13px] border border-gray-200 rounded-lg outline-none focus:border-brand"
+            >
+              <option value="">{t('infra.selectNode')}</option>
+              {nodes.map((n) => (
+                <option key={n.id} value={n.id}>
+                  {n.hostname} — {n.ip} ({n.os_name || n.os_family || 'Unknown OS'})
+                </option>
+              ))}
+            </select>
+          </div>
+          {nodes.length === 0 && (
+            <p className="text-[11px] text-amber-600 bg-amber-50 rounded-lg px-3 py-2">
+              {t('infra.noNodes')}
+            </p>
+          )}
+          {checkingPlatform && (
+            <div className="flex items-center gap-2 text-[11px] text-gray-400">
+              <Spinner size={11} /> {t('infra.checkingPlatform')}
+            </div>
+          )}
+          {platformCheck && !platformCheck.has_tarball && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 space-y-2">
+              <p className="text-[12px] font-semibold text-amber-800">
+                {t('infra.platformMissingTitle', { platform: platformCheck.platform })}
+              </p>
+              <p className="text-[11px] text-amber-700">{t('infra.platformMissingDesc')}</p>
+              <ul className="text-[11px] text-amber-700 space-y-2">
+                <li>
+                  <span className="font-semibold">{t('infra.platformOptionInternet')}</span>
+                  {' '}{t('infra.platformOptionInternetDesc')}
+                </li>
+                <li>
+                  <span className="font-semibold">{t('infra.platformOptionTarball')}</span>
+                  {' '}{t('infra.platformOptionTarballDesc')}
+                  <code className="block mt-1 px-2 py-1 bg-amber-100 rounded font-mono text-[10px] break-all">
+                    {platformCheck.packages_dir}/{platformCheck.tarball_name}
+                  </code>
+                </li>
+              </ul>
+              <p className="text-[11px] text-amber-600 italic">{t('infra.platformContinueAnyway')}</p>
+            </div>
+          )}
+          {platformCheck?.has_tarball && (
+            <p className="text-[11px] text-green-700 bg-green-50 rounded-lg px-3 py-2">
+              {t('infra.platformReady', { platform: platformCheck.platform })}
+            </p>
+          )}
+        </div>
+        <div className="flex justify-end gap-2 px-5 py-4 border-t border-gray-100">
+          <button onClick={onClose} className={btn(false)}>{t('common.cancel')}</button>
+          <button onClick={handleStart} disabled={!selectedNode || starting} className={btn(true)}>
+            {starting && <Spinner size={13} />}
+            {starting ? t('infra.starting') : t('infra.startInstall')}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Tab 1: Masters & Managers ─────────────────────────────────────────────────
+
+// ── Puppet edition switch (PE Advanced ⇄ Puppet Core) ────────────────────────
+
+function EditionControl({ nodes, onJobStarted, onCancel, t }) {
+  const [current, setCurrent]   = useState(null)   // 'enterprise' | 'core' | null
+  const [target, setTarget]     = useState('core')
+  const [nodeId, setNodeId]     = useState('')
+  const [busy, setBusy]         = useState(false)
+  const toast = useToast()
+
+  useEffect(() => {
+    getPuppetEdition()
+      .then((r) => { setCurrent(r.edition); setTarget(r.edition === 'core' ? 'enterprise' : 'core') })
+      .catch(() => setCurrent(null))
+  }, [])
+
+  async function handleSwitch() {
+    if (!nodeId) { toast('Select the master node to switch', 'error'); return }
+    setBusy(true)
+    try {
+      const job = await switchPuppetEdition(target, nodeId)
+      toast(`Switching master to ${target === 'core' ? 'Puppet Core' : 'Puppet Enterprise'}…`, 'success')
+      onJobStarted(job)
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const label = (e) => (e === 'core' ? 'Puppet Core (open source)' : e === 'enterprise' ? 'Puppet Enterprise' : 'Unknown')
+
+  return (
+    <div className="mt-4 p-4 bg-gray-50 rounded-xl border border-gray-200 space-y-3">
+      <p className="text-[11px] font-semibold text-gray-600 uppercase tracking-wider">
+        Puppet Edition
+      </p>
+      <p className="text-[11px] text-gray-500">
+        Current: <span className="font-medium text-gray-700">{label(current)}</span>.
+        Switching reinstalls the master with the chosen edition and removes the other
+        (PE and Core cannot coexist). Puppet Core uses the no-cost ENC classifier;
+        PE Advanced uses the RBAC + Node Classifier APIs.
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          value={target}
+          onChange={(e) => setTarget(e.target.value)}
+          className="px-3 py-2 text-[12px] border border-gray-200 rounded-lg outline-none focus:border-brand"
+        >
+          <option value="core">Switch to Puppet Core (open source)</option>
+          <option value="enterprise">Switch to Puppet Enterprise</option>
+        </select>
+        <select
+          value={nodeId}
+          onChange={(e) => setNodeId(e.target.value)}
+          className="px-3 py-2 text-[12px] border border-gray-200 rounded-lg outline-none focus:border-brand"
+        >
+          <option value="">Select master node…</option>
+          {nodes.map((n) => (
+            <option key={n.id} value={n.id}>{n.hostname} — {n.ip}</option>
+          ))}
+        </select>
+        <button onClick={handleSwitch} disabled={busy || !nodeId} className={btn(true)}>
+          {busy && <Spinner size={13} />}
+          {busy ? 'Starting…' : 'Switch'}
+        </button>
+        <button onClick={onCancel} className={btn(false)}>{t('common.cancel')}</button>
+      </div>
+      <p className="text-[11px] text-amber-700 bg-amber-50 rounded-lg px-3 py-2">
+        ⚠ Switching regenerates the master CA — agents must be re-enrolled afterwards.
+        Puppet Enterprise also requires its installer tarball staged on the platform.
+      </p>
+    </div>
+  )
+}
+
+function MasterCard({ service, status, nodes, onJobStarted, t }) {
+  const [showConnect, setShowConnect]   = useState(false)
+  const [showInstall, setShowInstall]   = useState(false)
+  const [showCreds,   setShowCreds]     = useState(false)
+  const [showEdition, setShowEdition]   = useState(false)
+  const isPuppet      = service === 'puppet'
+  const masterService = 'puppet-master'
+
+  return (
+    <>
+      <div className="bg-white rounded-xl border border-gray-100 p-5">
+        <div className="flex items-start justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-gray-50 border border-gray-100 flex items-center justify-center">
+              <Cpu size={16} className={status?.reachable ? 'text-brand' : 'text-gray-300'} />
+            </div>
+            <div>
+              <h3 className="text-[14px] font-semibold text-gray-900">
+                {t('infra.puppetMaster')}
+              </h3>
+              <p className="text-[11px] text-gray-400">
+                {t('infra.puppetDesc')}
+              </p>
+            </div>
+          </div>
+          <StatusBadge configured={status?.configured} reachable={status?.reachable} t={t} />
+        </div>
+
+        {status?.host && (
+          <div className="mb-4 px-3 py-2 bg-gray-50 rounded-lg">
+            <p className="text-[11px] text-gray-400 mb-0.5">{t('infra.host')}</p>
+            <p className="text-[12px] font-mono text-gray-700">{status.host}:{status.port}</p>
+          </div>
+        )}
+
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => { setShowConnect(!showConnect); setShowInstall(false); setShowCreds(false) }}
+            className={btnSm(false)}
+          >
+            <Link size={11} />
+            {status?.configured ? t('infra.changeHost') : t('infra.connectExisting')}
+          </button>
+          <button
+            onClick={() => { setShowConnect(false); setShowCreds(false); setShowEdition(false); setShowInstall(true) }}
+            className={btnSm(status?.configured ? false : true)}
+          >
+            <Server size={11} />
+            {t('infra.installOnNode')}
+          </button>
+          {isPuppet && (
+            <button
+              onClick={() => { setShowCreds(!showCreds); setShowConnect(false); setShowInstall(false); setShowEdition(false) }}
+              className={btnSm(false)}
+            >
+              <KeyRound size={11} />
+              {t('infra.setPECredentials')}
+            </button>
+          )}
+          {isPuppet && (
+            <button
+              onClick={() => { setShowEdition(!showEdition); setShowConnect(false); setShowInstall(false); setShowCreds(false) }}
+              className={btnSm(false)}
+            >
+              <GitBranch size={11} />
+              Edition
+            </button>
+          )}
+        </div>
+
+        {showConnect && (
+          <ConnectForm
+            service={service}
+            onSave={() => { setShowConnect(false) }}
+            onCancel={() => setShowConnect(false)}
+            t={t}
+          />
+        )}
+
+        {isPuppet && showCreds && (
+          <PuppetCredentialsForm
+            onSave={() => setShowCreds(false)}
+            onCancel={() => setShowCreds(false)}
+            t={t}
+          />
+        )}
+
+        {isPuppet && showEdition && (
+          <EditionControl
+            nodes={nodes}
+            onJobStarted={(job) => { setShowEdition(false); onJobStarted(job) }}
+            onCancel={() => setShowEdition(false)}
+            t={t}
+          />
+        )}
+      </div>
+
+      {showInstall && (
+        <InstallModal
+          service={masterService}
+          nodes={nodes}
+          onClose={() => setShowInstall(false)}
+          onJobStarted={(job) => { setShowInstall(false); onJobStarted(job) }}
+          t={t}
+        />
+      )}
+    </>
+  )
+}
+
+function MastersTab({ status, nodes, onRefresh, t }) {
+  const [activeJob, setActiveJob] = useState(null)
+
+  return (
+    <>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <MasterCard
+          service="puppet"
+          status={status?.puppet}
+          nodes={nodes}
+          onJobStarted={(job) => { setActiveJob(job); setTimeout(onRefresh, 8000) }}
+          t={t}
+        />
+      </div>
+
+      <div className="mt-4 p-4 bg-blue-50 border border-blue-100 rounded-xl">
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={14} className="text-blue-500 mt-0.5 flex-shrink-0" />
+          <div>
+            <p className="text-[12px] font-medium text-blue-800">{t('infra.mastersFirst')}</p>
+            <p className="text-[11px] text-blue-600 mt-0.5">{t('infra.mastersFirstDesc')}</p>
+          </div>
+        </div>
+      </div>
+
+      {activeJob && (
+        <LogDrawer job={activeJob} onClose={() => { setActiveJob(null); onRefresh() }} t={t} />
+      )}
+    </>
+  )
+}
+
+// ── Tab 2: Agents ─────────────────────────────────────────────────────────────
+
+function AgentsTab({ nodes, onRefresh, t }) {
+  const [selectedNode, setSelectedNode] = useState('')
+  const [agentSel, setAgentSel]         = useState({ puppet: true, detection: true })
+  const [platformCheck, setPlatformCheck]     = useState(null)
+  const [checkingPlatform, setCheckingPlatform] = useState(false)
+  const [launching, setLaunching]       = useState(false)
+  const [activeJob, setActiveJob]       = useState(null)
+  const toast = useToast()
+  const pager = usePagination(nodes)
+
+  const enrollable = nodes.filter((n) => n.status === 'reachable' || n.status === 'provisioned')
+
+  async function handleNodeChange(nodeId) {
+    setSelectedNode(nodeId)
+    setPlatformCheck(null)
+    if (!nodeId) return
+    // Pre-deselect agents that are already enrolled on this node
+    const chosen = nodes.find((n) => n.id === nodeId)
+    if (chosen) {
+      const puppet    = !chosen.puppet_enrolled
+      const detection = !chosen.detection_enrolled
+      setAgentSel(puppet || detection ? { puppet, detection } : { puppet: true, detection: true })
+    }
+    setCheckingPlatform(true)
+    try {
+      const result = await checkPuppetAgentPlatform(nodeId)
+      setPlatformCheck(result)
+    } catch (_) {}
+    finally { setCheckingPlatform(false) }
+  }
+
+  function toggleAgent(key) {
+    setAgentSel((prev) => {
+      const next = { ...prev, [key]: !prev[key] }
+      if (!next.puppet && !next.detection) return prev
+      return next
+    })
+  }
+
+  async function handleLaunch() {
+    if (!selectedNode) return
+    const toInstall = [
+      agentSel.puppet    && 'puppet-agent',
+      agentSel.detection && 'detection-agent',
+    ].filter(Boolean)
+    if (!toInstall.length) return
+
+    setLaunching(true)
+    try {
+      const jobs = await Promise.all(toInstall.map((svc) => installService(svc, selectedNode)))
+      setActiveJob(jobs[0])
+      setTimeout(onRefresh, 8000)
+      toast(t('infra.launchStarted', { count: jobs.length }), 'success')
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setLaunching(false)
+    }
+  }
+
+  const node = nodes.find((n) => n.id === selectedNode)
+  // canLaunch: node selected AND at least one non-enrolled agent is checked
+  const canLaunch = !!selectedNode && (
+    (agentSel.puppet    && !node?.puppet_enrolled) ||
+    (agentSel.detection && !node?.detection_enrolled)
+  )
+
+  // Per-node coverage
+  const enrolled = nodes.filter((n) => n.puppet_enrolled || n.detection_enrolled).length
+
+  return (
+    <>
+      <div className="bg-white rounded-xl border border-gray-100 p-5 mb-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {/* Left: Steps 1 & 2 */}
+          <div className="space-y-6">
+            {/* Step 1: Choose node */}
+            <div>
+              <div className="flex items-center gap-2 mb-3">
+                <span className="w-5 h-5 rounded-full bg-brand text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">1</span>
+                <h4 className="text-[13px] font-semibold text-gray-800">{t('infra.stepChooseNode')}</h4>
+              </div>
+              <div className="relative">
+                <select
+                  value={selectedNode}
+                  onChange={(e) => handleNodeChange(e.target.value)}
+                  className="w-full appearance-none pl-3 pr-8 py-2.5 text-[12px] border border-gray-200 rounded-lg outline-none focus:border-brand bg-white text-gray-700"
+                >
+                  <option value="">{t('infra.selectNode')}</option>
+                  {enrollable.map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {n.hostname} — {n.ip}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown size={13} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
+              </div>
+              {enrollable.length === 0 && (
+                <p className="mt-2 text-[11px] text-amber-600 bg-amber-50 rounded-lg px-3 py-2">
+                  {t('infra.noReachableNodes')}
+                </p>
+              )}
+              {checkingPlatform && (
+                <div className="flex items-center gap-2 mt-2 text-[11px] text-gray-400">
+                  <Spinner size={11} /> {t('infra.checkingPlatform')}
+                </div>
+              )}
+              {platformCheck && !platformCheck.has_tarball && (
+                <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                  <p className="text-[11px] font-semibold text-amber-800">
+                    {t('infra.platformMissingTitle', { platform: platformCheck.platform })}
+                  </p>
+                  <p className="text-[11px] text-amber-600 mt-0.5">{t('infra.platformContinueAnyway')}</p>
+                </div>
+              )}
+              {platformCheck?.has_tarball && (
+                <p className="mt-2 text-[11px] text-green-700 bg-green-50 rounded-lg px-3 py-2">
+                  {t('infra.platformReady', { platform: platformCheck.platform })}
+                </p>
+              )}
+            </div>
+
+            {/* Step 2: Pick agents */}
+            <div>
+              <div className="flex items-center gap-2 mb-3">
+                <span className="w-5 h-5 rounded-full bg-brand text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">2</span>
+                <h4 className="text-[13px] font-semibold text-gray-800">{t('infra.stepPickAgents')}</h4>
+                <span className="text-[11px] text-gray-400">{t('infra.pickAgentsHint')}</span>
+              </div>
+              <div className="space-y-2">
+                {[
+                  { key: 'puppet',    enrolledFlag: 'puppet_enrolled',    label: t('infra.puppetAgentLabel'),    desc: t('infra.puppetAgentDesc')    },
+                  { key: 'detection', enrolledFlag: 'detection_enrolled', label: t('infra.detectionAgentLabel'), desc: t('infra.detectionAgentDesc') },
+                ].map(({ key, enrolledFlag, label, desc }) => {
+                  const alreadyEnrolled = node ? !!node[enrolledFlag] : false
+                  return (
+                    <button
+                      key={key}
+                      onClick={() => !alreadyEnrolled && toggleAgent(key)}
+                      disabled={alreadyEnrolled}
+                      className={`w-full flex items-center gap-3 p-3 rounded-xl border-2 text-left transition-colors ${
+                        alreadyEnrolled
+                          ? 'border-green-200 bg-green-50 cursor-default'
+                          : agentSel[key]
+                            ? 'border-brand bg-brand/5'
+                            : 'border-gray-200 bg-white hover:border-gray-300'
+                      }`}
+                    >
+                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                        alreadyEnrolled ? 'bg-green-100' : agentSel[key] ? 'bg-brand/10' : 'bg-gray-100'
+                      }`}>
+                        <Cpu size={14} className={alreadyEnrolled ? 'text-green-600' : agentSel[key] ? 'text-brand' : 'text-gray-400'} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className={`text-[12px] font-semibold ${alreadyEnrolled ? 'text-green-700' : agentSel[key] ? 'text-brand' : 'text-gray-700'}`}>
+                          {label}
+                        </p>
+                        <p className="text-[11px] text-gray-400">
+                          {alreadyEnrolled ? t('infra.enrolled') : desc}
+                        </p>
+                      </div>
+                      <div className={`w-4 h-4 rounded border-2 flex items-center justify-center flex-shrink-0 ${
+                        alreadyEnrolled
+                          ? 'border-green-500 bg-green-500'
+                          : agentSel[key] ? 'border-brand bg-brand' : 'border-gray-300'
+                      }`}>
+                        {(alreadyEnrolled || agentSel[key]) && <CheckCircle size={10} className="text-white" />}
+                      </div>
+                    </button>
+                  )
+                })}
+              </div>
+
+              <div className="flex gap-2 mt-2">
+                {[
+                  { label: t('infra.selectBoth'),     fn: () => setAgentSel({ puppet: true, detection: true }) },
+                  { label: t('infra.puppetOnly'),     fn: () => setAgentSel({ puppet: true, detection: false }) },
+                  { label: t('infra.detectionOnly'),  fn: () => setAgentSel({ puppet: false, detection: true }) },
+                ].map(({ label, fn }) => (
+                  <button key={label} onClick={fn}
+                    className="px-2 py-1 text-[11px] text-gray-500 hover:text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Right: Step 3 launch */}
+          <div className="flex flex-col">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="w-5 h-5 rounded-full bg-brand text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0">3</span>
+              <h4 className="text-[13px] font-semibold text-gray-800">{t('infra.stepLaunch')}</h4>
+            </div>
+
+            <div className="flex-1 bg-gray-50 rounded-xl p-4 flex flex-col gap-3">
+              {!selectedNode ? (
+                <p className="text-[12px] text-gray-400">{t('infra.selectNodeFirst')}</p>
+              ) : (
+                <>
+                  <p className="text-[12px] text-gray-700 font-medium">
+                    {node?.hostname} ({node?.ip})
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {agentSel.puppet && (
+                      <span className="px-2 py-1 text-[11px] font-medium text-brand bg-brand/10 rounded-full">
+                        Puppet agent
+                      </span>
+                    )}
+                    {agentSel.detection && (
+                      <span className="px-2 py-1 text-[11px] font-medium text-brand bg-brand/10 rounded-full">
+                        {t('infra.detectionAgentLabel')}
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+
+              <div className="flex items-start gap-2 p-3 bg-white rounded-lg border border-gray-200 mt-auto">
+                <AlertTriangle size={12} className="text-gray-400 mt-0.5 flex-shrink-0" />
+                <p className="text-[11px] text-gray-500 leading-relaxed">{t('infra.launchHint')}</p>
+              </div>
+
+              <button
+                onClick={handleLaunch}
+                disabled={!canLaunch || launching}
+                className={`w-full ${btn(canLaunch)} justify-center`}
+              >
+                {launching ? <Spinner size={13} /> : <Server size={13} />}
+                {launching ? t('infra.starting') : t('infra.startInstall')}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Coverage table */}
+      <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
+          <h4 className="text-[13px] font-semibold text-gray-800">{t('infra.agentCoverage')}</h4>
+          <span className="text-[11px] text-gray-400">
+            {enrolled} / {nodes.length} {t('infra.agentCoverageCount')}
+          </span>
+        </div>
+        {nodes.length === 0 ? (
+          <p className="text-[12px] text-gray-400 text-center py-8">{t('infra.noNodes')}</p>
+        ) : (
+          <table className="w-full text-[12px]">
+            <thead>
+              <tr className="border-b border-gray-100">
+                <th className="text-left px-5 py-2.5 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">{t('infra.colNode')}</th>
+                <th className="text-left px-5 py-2.5 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">{t('infra.colPuppetAgent')}</th>
+                <th className="text-left px-5 py-2.5 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">{t('infra.colDetectionAgent')}</th>
+                <th className="px-5 py-2.5" />
+              </tr>
+            </thead>
+            <tbody>
+              {pager.pageItems.map((n) => (
+                <tr key={n.id} className="border-b border-gray-50 hover:bg-gray-50">
+                  <td className="px-5 py-3">
+                    <p className="font-medium text-gray-800">{n.hostname}</p>
+                    <p className="text-[11px] text-gray-400 font-mono">{n.ip}</p>
+                  </td>
+                  <td className="px-5 py-3">
+                    <Pip ok={n.puppet_enrolled || false} label={n.puppet_enrolled ? t('infra.enrolled') : t('infra.notEnrolled')} />
+                  </td>
+                  <td className="px-5 py-3">
+                    <Pip ok={n.detection_enrolled || false} label={n.detection_enrolled ? t('infra.enrolled') : t('infra.notEnrolled')} />
+                  </td>
+                  <td className="px-5 py-3 text-right">
+                    {n.puppet_enrolled && n.detection_enrolled ? (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium text-green-700 bg-green-50">
+                        <CheckCircle size={10} /> {t('infra.enrolled')}
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() => { setSelectedNode(n.id); handleNodeChange(n.id) }}
+                        className={btnSm(false)}
+                      >
+                        {t('infra.enroll')}
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <Pagination {...pager} />
+      </div>
+
+      {activeJob && (
+        <LogDrawer job={activeJob} onClose={() => { setActiveJob(null); onRefresh() }} t={t} />
+      )}
+    </>
+  )
+}
+
+// ── Tab 3: Verification (Scan readiness) ──────────────────────────────────────
+
+function VerifyTab({ nodes, onRefresh, t }) {
+  const [status, setStatus]       = useState(null)
+  const [loading, setLoading]     = useState(true)
+  const [installing, setInstalling] = useState(false)
+  const [verifying, setVerifying] = useState(false)
+  const [probing, setProbing]     = useState({})
+  const [probeErrors, setProbeErrors] = useState({})
+  const [diagnosing, setDiagnosing]   = useState({})
+  const [activeJob, setActiveJob]     = useState(null)
+  const [results, setResults]     = useState(null)
+  const toast = useToast()
+  const pager = usePagination(nodes)
+
+  async function loadStatus() {
+    try {
+      setStatus(await getScanEngineStatus())
+    } catch (_) {
+      setStatus({ installed: false, version: null })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { loadStatus() }, [])
+
+  async function handleInstall() {
+    setInstalling(true)
+    try {
+      const res = await installScanEngineOnController()
+      toast(t('infra.scanEngineInstallDone', { version: res.version || '' }), 'success')
+      await loadStatus()
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setInstalling(false)
+    }
+  }
+
+  async function handleVerifyAll() {
+    setVerifying(true)
+    setResults(null)
+    try {
+      const res = await verifyScanEngineAllNodes()
+      setResults(res)
+      toast(t('infra.scanEngineVerifyDone', { ok: res.reachable, total: res.total }), 'success')
+      onRefresh?.()
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setVerifying(false)
+    }
+  }
+
+  async function handleProbeNode(nodeId) {
+    setProbing((p) => ({ ...p, [nodeId]: true }))
+    setProbeErrors((p) => ({ ...p, [nodeId]: null }))
+    try {
+      const result = await verifyScanEngineNode(nodeId)
+      const errMsg = result.output || result.error || null
+      if (!result.reachable && errMsg) {
+        setProbeErrors((p) => ({ ...p, [nodeId]: errMsg }))
+      }
+      if (result.error) {
+        toast(result.error, 'warning')
+      }
+      onRefresh?.()
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setProbing((p) => ({ ...p, [nodeId]: false }))
+    }
+  }
+
+  async function handleDiagnose(nodeId) {
+    setDiagnosing((p) => ({ ...p, [nodeId]: true }))
+    try {
+      const job = await checkNodeHealth(nodeId)
+      setActiveJob(job)
+      toast(t('infra.diagStarted'), 'success')
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setDiagnosing((p) => ({ ...p, [nodeId]: false }))
+    }
+  }
+
+  const reachableCount = nodes.filter((n) => n.scan_ready).length
+
+  return (
+    <>
+      {/* Scan engine info card */}
+      <div className="bg-white rounded-xl border border-gray-100 p-5 mb-4">
+        <div className="flex items-start justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-gray-50 border border-gray-100 flex items-center justify-center">
+              <ShieldCheck size={16} className={status?.installed ? 'text-brand' : 'text-gray-300'} />
+            </div>
+            <div>
+              <h3 className="text-[14px] font-semibold text-gray-900">{t('infra.scanEngine')}</h3>
+              <p className="text-[11px] text-gray-400">{t('infra.scanEngineDesc')}</p>
+            </div>
+          </div>
+          {loading ? (
+            <Spinner size={12} />
+          ) : status?.installed ? (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-green-50 text-green-700">
+              <CheckCircle size={9} /> {t('infra.scanEngineInstalled')}
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-500">
+              {t('infra.scanEngineMissing')}
+            </span>
+          )}
+        </div>
+
+        <p className="text-[12px] text-gray-500 mb-4 leading-relaxed">{t('infra.scanEngineExplain')}</p>
+
+        <div className="grid grid-cols-2 gap-3 mb-4">
+          <div className="px-3 py-2 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-0.5">{t('infra.scanEnginePlatformVersion')}</p>
+            <p className="text-[12px] font-mono text-gray-700">
+              {status?.installed ? (status.version || 'installed') : t('infra.scanEngineMissing')}
+            </p>
+          </div>
+          <div className="px-3 py-2 bg-gray-50 rounded-lg">
+            <p className="text-[10px] text-gray-400 uppercase tracking-wider mb-0.5">{t('infra.scanEngineCoverage')}</p>
+            <p className="text-[12px] font-mono text-gray-700">
+              {reachableCount} / {nodes.length} {t('infra.scanEngineNodesReachable')}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          {!status?.installed && (
+            <button onClick={handleInstall} disabled={installing} className={btnSm(true)}>
+              {installing ? <Spinner size={11} /> : <Server size={11} />}
+              {installing ? t('infra.scanEngineInstalling') : t('infra.scanEngineInstallBtn')}
+            </button>
+          )}
+          <button
+            onClick={handleVerifyAll}
+            disabled={!status?.installed || verifying || nodes.length === 0}
+            className={btnSm(status?.installed)}
+          >
+            {verifying ? <Spinner size={11} /> : <RefreshCw size={11} />}
+            {verifying ? t('infra.scanEngineVerifying') : t('infra.scanEngineVerifyBtn')}
+          </button>
+        </div>
+
+        {results && results.results?.length > 0 && (
+          <div className="mt-4 border-t border-gray-100 pt-3">
+            <p className="text-[11px] font-semibold text-gray-600 uppercase tracking-wider mb-2">
+              {t('infra.scanEngineLastVerify')}
+            </p>
+            <div className="space-y-1.5 max-h-36 overflow-y-auto">
+              {results.results.map((r) => (
+                <div key={r.node_id || r.hostname} className="flex items-start gap-2 text-[11px]">
+                  {r.reachable ? (
+                    <CheckCircle size={11} className="text-green-500 mt-0.5 flex-shrink-0" />
+                  ) : (
+                    <XCircle size={11} className="text-red-500 mt-0.5 flex-shrink-0" />
+                  )}
+                  <span className="font-mono text-gray-700">{r.hostname || r.node_id?.slice(0, 8)}</span>
+                  {!r.reachable && (r.output || r.error) && (
+                    <span className="text-red-600 truncate" title={r.output || r.error}>
+                      — {(r.output || r.error).split('\n').slice(-1).join(' ').slice(0, 60)}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Per-node table */}
+      <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-100">
+          <h4 className="text-[13px] font-semibold text-gray-800">{t('infra.nodeScanReadiness')}</h4>
+          <span className="text-[11px] text-gray-400">
+            {reachableCount} / {nodes.length} {t('infra.scanEngineNodesReachable')}
+          </span>
+        </div>
+        {nodes.length === 0 ? (
+          <p className="text-[12px] text-gray-400 text-center py-8">{t('infra.noNodes')}</p>
+        ) : (
+          <table className="w-full text-[12px]">
+            <thead>
+              <tr className="border-b border-gray-100">
+                <th className="text-left px-5 py-2.5 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">{t('infra.colNode')}</th>
+                <th className="text-left px-5 py-2.5 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">{t('infra.colSshReach')}</th>
+                <th className="text-left px-5 py-2.5 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">{t('infra.colLastProbe')}</th>
+                <th className="px-5 py-2.5" />
+              </tr>
+            </thead>
+            <tbody>
+              {pager.pageItems.map((n) => (
+                <tr key={n.id} className="border-b border-gray-50 hover:bg-gray-50">
+                  <td className="px-5 py-3">
+                    <p className="font-medium text-gray-800">{n.hostname}</p>
+                    <p className="text-[11px] text-gray-400 font-mono">{n.ip}</p>
+                  </td>
+                  <td className="px-5 py-3">
+                    <Pip ok={n.scan_ready || false} label={n.scan_ready ? t('infra.reachable') : t('infra.unreachable')} />
+                    {probeErrors[n.id] && (
+                      <p
+                        className="text-[10px] text-red-500 font-mono mt-1 max-w-[220px] truncate cursor-help"
+                        title={probeErrors[n.id]}
+                      >
+                        {probeErrors[n.id].split('\n')[0]}
+                      </p>
+                    )}
+                  </td>
+                  <td className="px-5 py-3 text-gray-500">
+                    {timeAgo(n.updated_at)}
+                  </td>
+                  <td className="px-5 py-3 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        onClick={() => handleProbeNode(n.id)}
+                        disabled={probing[n.id]}
+                        className={btnSm(false)}
+                      >
+                        {probing[n.id] ? <Spinner size={11} /> : <Search size={11} />}
+                        {t('infra.probe')}
+                      </button>
+                      <button
+                        onClick={() => handleDiagnose(n.id)}
+                        disabled={diagnosing[n.id]}
+                        className={btnSm(false)}
+                        title={t('infra.diagnoseHint')}
+                      >
+                        {diagnosing[n.id] ? <Spinner size={11} /> : <AlertTriangle size={11} />}
+                        {diagnosing[n.id] ? t('infra.diagnosing') : t('infra.diagnose')}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <Pagination {...pager} />
+      </div>
+
+      {activeJob && (
+        <LogDrawer job={activeJob} onClose={() => { setActiveJob(null); onRefresh() }} t={t} />
+      )}
+    </>
+  )
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
+
+export default function InfrastructurePage() {
+  const t = useT()
+  const [status, setStatus]     = useState(null)
+  const [nodes, setNodes]       = useState([])
+  const [loading, setLoading]   = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [activeTab, setActiveTab]   = useState('masters')
+
+  async function load() {
+    try {
+      const [s, n] = await Promise.all([getInfrastructureStatus(), listNodes()])
+      setStatus(s)
+      setNodes(n)
+    } catch (_) {}
+    finally {
+      setLoading(false)
+      setRefreshing(false)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  function handleRefresh() {
+    setRefreshing(true)
+    load()
+  }
+
+  const enrolledCount = nodes.filter((n) => n.puppet_enrolled || n.detection_enrolled).length
+
+  const TABS = [
+    { key: 'masters', label: t('infra.tabMasters') },
+    { key: 'agents',  label: t('infra.tabAgents'),  pill: `${enrolledCount}/${nodes.length}` },
+    { key: 'verify',  label: t('infra.tabVerify') },
+  ]
+
+  return (
+    <div className="p-6 max-w-5xl">
+      <div className="flex items-center justify-between mb-5">
+        <div>
+          <h2 className="text-[18px] font-semibold text-gray-900">{t('infra.title')}</h2>
+          <p className="text-[12px] text-gray-400 mt-0.5">{t('infra.subtitle')}</p>
+        </div>
+        <button onClick={handleRefresh} disabled={refreshing} className={btnSm(false)}>
+          {refreshing ? <Spinner size={11} /> : <RefreshCw size={11} />}
+          {t('common.refresh')}
+        </button>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex items-center gap-1 mb-5 border-b border-gray-200 -mx-0.5 px-0.5">
+        {TABS.map(({ key, label, pill }) => (
+          <button
+            key={key}
+            onClick={() => setActiveTab(key)}
+            className={`flex items-center gap-2 px-4 py-2.5 text-[12px] font-medium border-b-2 transition-colors -mb-px ${
+              activeTab === key
+                ? 'border-brand text-brand'
+                : 'border-transparent text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            {label}
+            {pill && (
+              <span className={`px-1.5 py-0.5 text-[10px] font-semibold rounded-full ${
+                activeTab === key ? 'bg-brand/10 text-brand' : 'bg-gray-100 text-gray-500'
+              }`}>
+                {pill}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {loading ? (
+        <div className="space-y-4">
+          {[1, 2].map((i) => (
+            <div key={i} className="h-40 rounded-xl bg-gray-100 animate-pulse" />
+          ))}
+        </div>
+      ) : (
+        <>
+          {activeTab === 'masters' && (
+            <MastersTab status={status} nodes={nodes} onRefresh={handleRefresh} t={t} />
+          )}
+          {activeTab === 'agents' && (
+            <AgentsTab nodes={nodes} onRefresh={handleRefresh} t={t} />
+          )}
+          {activeTab === 'verify' && (
+            <VerifyTab nodes={nodes} onRefresh={handleRefresh} t={t} />
+          )}
+        </>
+      )}
+
+      {/* Preflight info (always visible) */}
+      {!loading && (
+        <div className="mt-6 p-4 bg-white border border-gray-100 rounded-xl">
+          <p className="text-[12px] font-semibold text-gray-800 mb-3">{t('infra.preflightTitle')}</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2.5">
+            {[
+              'preflightTime', 'preflightReach', 'preflightDns',
+              'preflightClone', 'preflightResources', 'preflightAirgap',
+            ].map((key) => (
+              <div key={key} className="flex items-start gap-2">
+                <CheckCircle size={13} className="text-green-500 mt-0.5 flex-shrink-0" />
+                <p className="text-[11px] text-gray-600 leading-snug">{t(`infra.${key}`)}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}

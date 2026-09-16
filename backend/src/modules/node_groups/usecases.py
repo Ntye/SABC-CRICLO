@@ -1,0 +1,1052 @@
+from __future__ import annotations
+import logging
+import re
+import uuid
+from datetime import datetime
+
+from core.domain.entities import NodeGroup
+from core.errors import NotFoundError, ConflictError, ForbiddenError, ValidationError
+
+logger = logging.getLogger(__name__)
+
+# Facts exposed to the rule builder, mapped to Node attributes.
+FACT_ATTRS = {
+    "hostname": "hostname",
+    "ip": "ip",
+    "fqdn": "fqdn",
+    "os_family": "os_family",
+    "os_name": "os_name",
+    "os_version": "os_version",
+    "status": "status",
+    "tags": "tags",
+    "puppet_enrolled": "puppet_enrolled",
+    "detection_enrolled": "detection_enrolled",
+}
+
+VALID_OPERATORS = {"=", "!=", "~", ">", ">=", "<", "<="}
+
+
+def _node_value(node, fact: str):
+    attr = FACT_ATTRS.get(fact)
+    if not attr:
+        return None
+    return getattr(node, attr, None)
+
+
+def _cmp(actual, op: str, value: str) -> bool:
+    if isinstance(actual, bool):
+        want = str(value).strip().lower() in ("true", "1", "yes")
+        return (actual == want) if op == "=" else (actual != want) if op == "!=" else False
+    if isinstance(actual, (list, tuple)):
+        joined = [str(x).lower() for x in actual]
+        v = str(value).lower()
+        if op == "=":
+            return v in joined
+        if op == "!=":
+            return v not in joined
+        if op == "~":
+            return any(re.search(value, str(x), re.IGNORECASE) for x in actual)
+        return False
+    a = "" if actual is None else str(actual)
+    if op == "=":
+        return a.lower() == str(value).lower()
+    if op == "!=":
+        return a.lower() != str(value).lower()
+    if op == "~":
+        try:
+            return bool(re.search(value, a, re.IGNORECASE))
+        except re.error:
+            return value.lower() in a.lower()
+    # numeric comparisons fall back to lexical when non-numeric
+    try:
+        an, vn = float(a), float(value)
+    except (TypeError, ValueError):
+        an, vn = a, str(value)
+    if op == ">":
+        return an > vn
+    if op == ">=":
+        return an >= vn
+    if op == "<":
+        return an < vn
+    if op == "<=":
+        return an <= vn
+    return False
+
+
+def node_matches(node, rules: list[dict], match_type: str) -> bool:
+    if not rules:
+        return False
+    checks = [_cmp(_node_value(node, r.get("fact", "")), r.get("operator", "="), r.get("value", ""))
+              for r in rules]
+    return all(checks) if (match_type or "all") == "all" else any(checks)
+
+
+def _certname(node) -> str:
+    return node.fqdn or node.hostname
+
+
+async def resolve_matching(group: NodeGroup, node_repo) -> dict:
+    """Resolve which registered nodes belong to a group.
+
+    Returns:
+        ids              node ids of pinned ∪ rule-matched nodes
+        hostnames        their hostnames
+        pinned_certnames certnames of *explicitly pinned* nodes only
+        certnames        certnames of *all* matched nodes (pinned ∪ rule)
+
+    ``certnames`` is what we pin into the Puppet classifier rule so every node
+    the platform considers a member is explicitly classified into the PE group
+    — without relying on PE re-deriving membership from agent facts.
+    """
+    all_nodes = await node_repo.find_all({})
+    pinned_set = set(group.node_ids or [])
+    matched_ids, hostnames, pinned_certs, certnames = set(), [], [], []
+    for n in all_nodes:
+        is_pinned = n.id in pinned_set
+        is_rule = node_matches(n, group.rules, group.match_type)
+        if is_pinned:
+            pinned_certs.append(_certname(n))
+        if is_pinned or is_rule:
+            matched_ids.add(n.id)
+            hostnames.append(n.hostname)
+            certnames.append(_certname(n))
+    return {"ids": list(matched_ids), "hostnames": hostnames,
+            "pinned_certnames": pinned_certs, "certnames": certnames}
+
+
+
+def _validate(data: dict) -> None:
+    for r in data.get("rules") or []:
+        if r.get("fact") not in FACT_ATTRS:
+            raise ValidationError(f"Unknown fact '{r.get('fact')}'")
+        if r.get("operator") not in VALID_OPERATORS:
+            raise ValidationError(f"Invalid operator '{r.get('operator')}'")
+    if (data.get("match_type") or "all") not in ("all", "any"):
+        raise ValidationError("match_type must be 'all' or 'any'")
+
+
+# ── Default OS-family hierarchy ───────────────────────────────────────────────
+# Built from outermost (SABC Managed) down to version-specific leaves.
+# Each node matches all groups for which its facts satisfy the rules.
+# Puppet inherits classes top-down; the most specific group wins for InSpec profile.
+#
+# IMPORTANT — matching against real facts collected by RegisterNodeUseCase._detect_os:
+#   os_family  = "Debian" | "RedHat" | "Unknown"   (exact)
+#   os_name    = os-release PRETTY_NAME (fallback NAME), e.g. "Ubuntu 22.04.3 LTS",
+#                "Debian GNU/Linux 12 (bookworm)", "CentOS Linux 7 (Core)",
+#                "Rocky Linux 9.3 (Blue Onyx)", "AlmaLinux 8.9 (Midnight Oncilla)".
+#                → distro rules MUST use the "~" (substring/regex) operator, not "=".
+#   os_version = os-release VERSION_ID, e.g. "22.04", "12", "7", "8", "9.3".
+#                → RHEL-family majors anchor on "^N" (no trailing dot) because
+#                  CentOS/Rocky may report bare "8" or "8.9".
+
+_UBUNTU_CHILDREN = [
+    {"name": "Ubuntu 20.04", "parent": "Ubuntu", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Ubuntu"},
+        {"fact": "os_version", "operator": "~", "value": r"^20\."},
+    ]},
+    {"name": "Ubuntu 22.04", "parent": "Ubuntu", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Ubuntu"},
+        {"fact": "os_version", "operator": "~", "value": r"^22\."},
+    ]},
+    {"name": "Ubuntu 24.04", "parent": "Ubuntu", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Ubuntu"},
+        {"fact": "os_version", "operator": "~", "value": r"^24\."},
+    ]},
+]
+
+_DEBIAN_CHILDREN = [
+    {"name": "Debian 11", "parent": "Debian", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Debian"},
+        {"fact": "os_version", "operator": "~", "value": r"^11"},
+    ]},
+    {"name": "Debian 12", "parent": "Debian", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Debian"},
+        {"fact": "os_version", "operator": "~", "value": r"^12"},
+    ]},
+]
+
+_ROCKY_CHILDREN = [
+    {"name": "Rocky Linux 8", "parent": "Rocky Linux", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Rocky"},
+        {"fact": "os_version", "operator": "~", "value": r"^8"},
+    ]},
+    {"name": "Rocky Linux 9", "parent": "Rocky Linux", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Rocky"},
+        {"fact": "os_version", "operator": "~", "value": r"^9"},
+    ]},
+]
+
+_CENTOS_CHILDREN = [
+    {"name": "CentOS 7", "parent": "CentOS", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "CentOS"},
+        {"fact": "os_version", "operator": "~", "value": r"^7"},
+    ]},
+    {"name": "CentOS Stream 8", "parent": "CentOS", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "CentOS"},
+        {"fact": "os_version", "operator": "~", "value": r"^8"},
+    ]},
+]
+
+_ALMA_CHILDREN = [
+    {"name": "AlmaLinux 8", "parent": "AlmaLinux", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "AlmaLinux"},
+        {"fact": "os_version", "operator": "~", "value": r"^8"},
+    ]},
+    {"name": "AlmaLinux 9", "parent": "AlmaLinux", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "AlmaLinux"},
+        {"fact": "os_version", "operator": "~", "value": r"^9"},
+    ]},
+]
+
+# RHEL os-release PRETTY_NAME is "Red Hat Enterprise Linux N.M (...)", so distro
+# and version rules match os_name on the "Red Hat Enterprise Linux" substring.
+_RHEL_CHILDREN = [
+    {"name": "RHEL 7", "parent": "Red Hat Enterprise Linux", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Red Hat Enterprise Linux"},
+        {"fact": "os_version", "operator": "~", "value": r"^7"},
+    ]},
+    {"name": "RHEL 8", "parent": "Red Hat Enterprise Linux", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Red Hat Enterprise Linux"},
+        {"fact": "os_version", "operator": "~", "value": r"^8"},
+    ]},
+    {"name": "RHEL 9", "parent": "Red Hat Enterprise Linux", "rules": [
+        {"fact": "os_name", "operator": "~", "value": "Red Hat Enterprise Linux"},
+        {"fact": "os_version", "operator": "~", "value": r"^9"},
+    ]},
+]
+
+DEFAULT_NODE_GROUP_TREE = [
+    {
+        "name": "SABC Managed Nodes",
+        "description": "All nodes enrolled in the SABC compliance platform",
+        "parent": "All Nodes",
+        "match_type": "any",
+        "rules": [
+            {"fact": "puppet_enrolled", "operator": "=", "value": "true"},
+            {"fact": "detection_enrolled", "operator": "=", "value": "true"},
+        ],
+        "inspec_profile_id": "sabc-linux-baseline",
+        "children": [
+            {
+                "name": "Debian Family",
+                "description": "Nodes running a Debian-based OS — uses apt for package management",
+                "parent": "SABC Managed Nodes",
+                "rules": [{"fact": "os_family", "operator": "=", "value": "Debian"}],
+                "inspec_profile_id": "sabc-linux-baseline",
+                "children": [
+                    {
+                        "name": "Ubuntu",
+                        "description": "Ubuntu Linux servers",
+                        "parent": "Debian Family",
+                        "rules": [{"fact": "os_name", "operator": "~", "value": "Ubuntu"}],
+                        "inspec_profile_id": "sabc-linux-baseline",
+                        "children": _UBUNTU_CHILDREN,
+                    },
+                    {
+                        "name": "Debian",
+                        "description": "Debian Linux servers",
+                        "parent": "Debian Family",
+                        "rules": [{"fact": "os_name", "operator": "~", "value": "Debian"}],
+                        "inspec_profile_id": "sabc-linux-baseline",
+                        "children": _DEBIAN_CHILDREN,
+                    },
+                ],
+            },
+            {
+                "name": "RedHat Family",
+                "description": "Nodes running a Red Hat-based OS — uses yum/dnf for package management",
+                "parent": "SABC Managed Nodes",
+                "rules": [{"fact": "os_family", "operator": "=", "value": "RedHat"}],
+                "inspec_profile_id": "sabc-linux-baseline",
+                "children": [
+                    {
+                        "name": "Red Hat Enterprise Linux",
+                        "description": "Red Hat Enterprise Linux (RHEL) servers",
+                        "parent": "RedHat Family",
+                        "rules": [{"fact": "os_name", "operator": "~", "value": "Red Hat Enterprise Linux"}],
+                        "inspec_profile_id": "sabc-linux-baseline",
+                        "children": _RHEL_CHILDREN,
+                    },
+                    {
+                        "name": "Rocky Linux",
+                        "description": "Rocky Linux servers",
+                        "parent": "RedHat Family",
+                        "rules": [{"fact": "os_name", "operator": "~", "value": "Rocky"}],
+                        "inspec_profile_id": "sabc-linux-baseline",
+                        "children": _ROCKY_CHILDREN,
+                    },
+                    {
+                        "name": "CentOS",
+                        "description": "CentOS Linux servers",
+                        "parent": "RedHat Family",
+                        "rules": [{"fact": "os_name", "operator": "~", "value": "CentOS"}],
+                        "inspec_profile_id": "sabc-linux-baseline",
+                        "children": _CENTOS_CHILDREN,
+                    },
+                    {
+                        "name": "AlmaLinux",
+                        "description": "AlmaLinux servers",
+                        "parent": "RedHat Family",
+                        "rules": [{"fact": "os_name", "operator": "~", "value": "AlmaLinux"}],
+                        "inspec_profile_id": "sabc-linux-baseline",
+                        "children": _ALMA_CHILDREN,
+                    },
+                ],
+            },
+        ],
+    },
+]
+
+
+class SeedDefaultNodeGroupsUseCase:
+    """Idempotently seeds the OS-family node group hierarchy at startup.
+
+    Only writes to the local DB — does not call Puppet Enterprise, which may
+    not be reachable at startup. System groups appear as unsynced and can be
+    pushed to PE once the master host is configured.
+    """
+    def __init__(self, repo):
+        self._repo = repo
+
+    async def execute(self) -> int:
+        created = 0
+        created += await self._seed_tree(DEFAULT_NODE_GROUP_TREE)
+        return created
+
+    async def _seed_tree(self, entries: list[dict]) -> int:
+        created = 0
+        for entry in entries:
+            children = entry.get("children", [])
+            existing = await self._repo.find_by_name(entry["name"])
+            if not existing:
+                now = datetime.utcnow()
+                g = NodeGroup(
+                    id=str(uuid.uuid4()),
+                    name=entry["name"],
+                    description=entry.get("description"),
+                    parent=entry.get("parent", "All Nodes"),
+                    environment="production",
+                    is_environment_group=False,
+                    match_type=entry.get("match_type", "all"),
+                    rules=entry.get("rules", []),
+                    node_ids=[],
+                    group_type="system",
+                    inspec_profile_id=entry.get("inspec_profile_id"),
+                    created_at=now,
+                    updated_at=now,
+                )
+                await self._repo.save(g)
+                created += 1
+                logger.info("Seeded system node group: %s", entry["name"])
+            else:
+                # Repair any drift from older flat-hierarchy DB records.
+                # The parent field drives the populated() walk in sync — if it
+                # points to "All Nodes" instead of the correct tree parent the
+                # intermediate ancestors (e.g. "Debian Family") are invisible to
+                # the descendant check and the whole subtree is skipped.
+                expected_parent = entry.get("parent", "All Nodes")
+                expected_rules  = entry.get("rules", [])
+                expected_match  = entry.get("match_type", "all")
+                changed = False
+                if existing.parent != expected_parent:
+                    logger.info(
+                        "Repairing parent of system group '%s': '%s' → '%s'",
+                        entry["name"], existing.parent, expected_parent,
+                    )
+                    existing.parent = expected_parent
+                    # If the parent changed the group's position in the tree also
+                    # changed — drop the stale PE id so sync recreates it in the
+                    # correct location (PE never re-parents via delta update).
+                    if existing.puppet_group_id:
+                        logger.info(
+                            "Clearing stale puppet_group_id for '%s' so sync recreates it under the correct parent",
+                            entry["name"],
+                        )
+                        existing.puppet_group_id = None
+                        existing.puppet_synced = False
+                    changed = True
+                if existing.rules != expected_rules:
+                    existing.rules = expected_rules
+                    changed = True
+                if existing.match_type != expected_match:
+                    existing.match_type = expected_match
+                    changed = True
+                if changed:
+                    existing.updated_at = datetime.utcnow()
+                    await self._repo.update(existing)
+            if children:
+                created += await self._seed_tree(children)
+        return created
+
+
+class SyncAllNodeGroupsUseCase:
+    """Reconcile node groups with Puppet Enterprise.
+
+    Only groups that actually contain nodes are materialised in the Puppet
+    console — the auto-seeded OS-family tree would otherwise litter PE with
+    empty distro/version groups (e.g. RedHat/CentOS on an all-Ubuntu fleet).
+    The reconciliation rule is:
+
+      * A **user** group (admin-created) is always pushed — the admin made it
+        on purpose and expects to see it even before nodes match.
+      * A **system** group (auto-seeded) is pushed only when its subtree holds
+        at least one matching node. "Subtree" is walked by parent pointers, so
+        an otherwise-empty ancestor (e.g. "SABC Managed Nodes") is still
+        created whenever one of its descendants is populated — the PE hierarchy
+        never ends up with a dangling ``parent_id``.
+      * A system group that *was* created in PE but is now empty is removed
+        from the console (children first) so the view stays clean.
+
+    Every matched node is pinned into the PE rule by certname, so the nodes the
+    platform considers members are explicitly classified into the group rather
+    than relying on PE re-deriving membership from agent facts.
+
+    Create/update runs parent-first (``created_at`` ascending — the seeder
+    inserts parents before children) so a parent's ``puppet_group_id`` exists
+    before a child resolves its ``parent_id``. Removal runs child-first
+    (reverse order) because PE refuses to delete a group that still has
+    children.
+    """
+    def __init__(self, repo, node_repo, puppet_client,
+                 puppet_core_client=None, config_repo=None):
+        self._repo = repo
+        self._node_repo = node_repo
+        self._puppet = puppet_client
+        self._core = puppet_core_client
+        self._config_repo = config_repo
+
+    async def _edition(self) -> str:
+        """Resolve the active Puppet edition: 'enterprise' (PE Advanced) or
+        'core' (open-source Puppet via ENC). Console-set value (config DB) wins
+        over the startup env default."""
+        if self._config_repo:
+            try:
+                e = await self._config_repo.get("puppet_edition")
+                if e:
+                    return e.strip().lower()
+            except Exception:
+                pass
+        from config import get_settings
+        return (get_settings().puppet_edition or "enterprise").strip().lower()
+
+    async def execute(self) -> dict:
+        groups = await self._repo.find_all()  # created_at ascending
+
+        # Puppet Core has no RBAC/Node-Classifier API — classification goes
+        # through the ENC path instead, which never touches those PE-only APIs.
+        if await self._edition() == "core":
+            return await self._sync_core(groups)
+
+        # Is a Puppet master actually configured? If not, the classifier client
+        # silently no-ops and we must NOT report groups as synced to PE.
+        puppet_ready = False
+        try:
+            puppet_ready = await self._puppet.is_configured()
+        except Exception as e:
+            logger.warning("Puppet readiness check failed: %s", e)
+
+        # Resolve membership for every group up front.
+        resolved = {g.id: await resolve_matching(g, self._node_repo) for g in groups}
+        total_nodes = sum(len(resolved[g.id]["ids"]) for g in groups)
+
+        by_name: dict[str, NodeGroup] = {g.name: g for g in groups}
+
+        # Index children by parent name so we can test whole subtrees.
+        children: dict[str, list[NodeGroup]] = {}
+        for g in groups:
+            children.setdefault(g.parent, []).append(g)
+
+        # A group is "populated" if it — or any descendant — matches a node.
+        _pop_cache: dict[str, bool] = {}
+
+        def populated(g: NodeGroup) -> bool:
+            if g.id in _pop_cache:
+                return _pop_cache[g.id]
+            _pop_cache[g.id] = False  # break any pathological parent cycle
+            result = bool(resolved[g.id]["ids"]) or any(
+                populated(c) for c in children.get(g.name, [])
+            )
+            _pop_cache[g.id] = result
+            return result
+
+        def should_push(g: NodeGroup) -> bool:
+            # User groups always appear; a system group is materialised in PE only
+            # when it (or a descendant) actually matches a node — so the RedHat
+            # branch shows up the moment a RHEL host is recognised, and an
+            # all-Ubuntu fleet is not littered with empty CentOS/Rocky groups.
+            # Because populated() walks descendants, every ancestor of a matched
+            # leaf is itself "populated", so the whole parent chain is created and
+            # the PE hierarchy is never left with a dangling parent.
+            return g.group_type != "system" or populated(g)
+
+        # Depth within the managed tree (parents have a smaller depth than their
+        # children) so we can process parents before children regardless of the
+        # created_at order — the PE parent must exist before a child references it.
+        def depth(g: NodeGroup) -> int:
+            d, seen, cur = 0, set(), g
+            while cur and cur.parent in by_name and cur.parent not in seen:
+                seen.add(cur.parent)
+                cur = by_name[cur.parent]
+                d += 1
+            return d
+
+        ordered = sorted(groups, key=depth)  # stable → keeps created_at order per level
+
+        # Live map of group name → PE group id, seeded from what is already in PE
+        # and updated as we create groups, so a child always resolves the *current*
+        # parent id without a stale DB read.
+        pe_ids: dict[str, str] = {g.name: g.puppet_group_id for g in groups if g.puppet_group_id}
+
+        def parent_pe_id(g: NodeGroup):
+            # None → PE root group. A managed parent resolves to its live PE id.
+            if not g.parent or g.parent == "All Nodes" or g.parent not in by_name:
+                return None
+            return pe_ids.get(g.parent)
+
+        synced = failed = skipped = removed = pushed = 0
+
+        _PE_ROOT = "00000000-0000-4000-8000-000000000000"
+
+        # ── Pass 0: fix groups misparented in PE ──────────────────────────────
+        # PE's POST /classifier-api/v1/groups/{id} (delta update) silently
+        # ignores changes to the ``parent`` field — it never re-parents an
+        # existing group. Groups that were first synced flat (all under root)
+        # therefore stay flat no matter how many times we call update. The fix
+        # is to delete those groups from PE (deepest first so PE doesn't refuse
+        # the delete) and let Pass 2 recreate them with the correct parent.
+        if puppet_ready:
+            try:
+                pe_groups_raw = await self._puppet.list_groups()
+            except Exception as e:
+                logger.warning("Pass 0: could not fetch PE group list — hierarchy check skipped: %s", e)
+                pe_groups_raw = []
+
+            if pe_groups_raw:
+                pe_by_id: dict[str, dict] = {g["id"]: g for g in pe_groups_raw}
+                sabc_by_pe_id: dict[str, NodeGroup] = {
+                    g.puppet_group_id: g for g in groups if g.puppet_group_id
+                }
+
+                # Identify SABC groups whose PE parent does not match expectation.
+                wrong_pe_ids: set[str] = set()
+                for g in ordered:
+                    if not g.puppet_group_id or g.puppet_group_id not in pe_by_id:
+                        continue
+                    expected = parent_pe_id(g) or _PE_ROOT
+                    actual   = pe_by_id[g.puppet_group_id].get("parent") or _PE_ROOT
+                    if actual != expected:
+                        logger.info(
+                            "Pass 0: PE group '%s' misparented (actual=%s expected=%s) — will delete and recreate",
+                            g.name, actual, expected,
+                        )
+                        wrong_pe_ids.add(g.puppet_group_id)
+
+                if wrong_pe_ids:
+                    # Build PE child index so we can cascade deletes to descendants.
+                    pe_children_idx: dict[str, list[str]] = {}
+                    for pg in pe_groups_raw:
+                        p = pg.get("parent")
+                        if p:
+                            pe_children_idx.setdefault(p, []).append(pg["id"])
+
+                    def _collect_pe_descendants(pe_id: str, out: set) -> None:
+                        for child_id in pe_children_idx.get(pe_id, []):
+                            if child_id not in out:
+                                out.add(child_id)
+                                _collect_pe_descendants(child_id, out)
+
+                    all_to_delete: set[str] = set()
+                    for pe_id in wrong_pe_ids:
+                        all_to_delete.add(pe_id)
+                        _collect_pe_descendants(pe_id, all_to_delete)
+
+                    def _pe_depth(pe_id: str) -> int:
+                        d, seen, cur = 0, set(), pe_id
+                        while True:
+                            pg = pe_by_id.get(cur)
+                            if not pg:
+                                break
+                            parent = pg.get("parent")
+                            if not parent or parent in seen:
+                                break
+                            seen.add(cur)
+                            cur = parent
+                            d += 1
+                        return d
+
+                    # Delete deepest groups first so PE never blocks on children.
+                    for pe_id in sorted(all_to_delete, key=_pe_depth, reverse=True):
+                        try:
+                            await self._puppet.delete_node_group(pe_id)
+                            logger.info("Pass 0: deleted misparented PE group %s", pe_id)
+                        except Exception as e:
+                            logger.warning("Pass 0: failed to delete PE group %s: %s", pe_id, e)
+                        sabc_g = sabc_by_pe_id.get(pe_id)
+                        if sabc_g:
+                            sabc_g.puppet_group_id = None
+                            sabc_g.puppet_synced = False
+                            pe_ids.pop(sabc_g.name, None)
+                            sabc_g.updated_at = datetime.utcnow()
+                            await self._repo.update(sabc_g)
+
+        # ── Pass 1: remove now-empty system groups (children before parents) ──
+        # Pass 2 owns the skipped count; this pass only deletes stale PE groups.
+        for g in reversed(ordered):
+            if should_push(g) or g.group_type != "system":
+                continue
+            if not g.puppet_group_id:
+                continue
+            try:
+                await self._puppet.delete_node_group(g.puppet_group_id)
+            except Exception as e:
+                logger.warning("Puppet remove empty group '%s' failed: %s", g.name, e)
+            pe_ids.pop(g.name, None)
+            g.puppet_group_id = None
+            g.puppet_synced = False
+            g.updated_at = datetime.utcnow()
+            await self._repo.update(g)
+            removed += 1
+
+        # ── Pass 2: create/update populated groups (parents before children) ──
+        for g in ordered:
+            if not should_push(g):
+                skipped += 1
+                continue
+            certnames = resolved[g.id]["certnames"]
+            puppet_ok = True
+            try:
+                parent_id = parent_pe_id(g)
+                if g.puppet_group_id:
+                    # Update the existing PE group (re-parents if needed).
+                    # Returns False when PE no longer has this group (manual deletion).
+                    found = await self._puppet.update_node_group(
+                        g.puppet_group_id, name=g.name, description=g.description,
+                        environment=g.environment, parent_id=parent_id,
+                        match_type=g.match_type, rules=g.rules,
+                        pinned_certnames=certnames,
+                    )
+                    if not found:
+                        # Group was deleted from the PE console — clear stale id
+                        # and fall through to create it in the correct position.
+                        logger.info(
+                            "PE group '%s' (id=%s) no longer exists — recreating",
+                            g.name, g.puppet_group_id,
+                        )
+                        g.puppet_group_id = None
+                        pe_ids.pop(g.name, None)
+                if not g.puppet_group_id:
+                    # New group or recreation after stale id was cleared.
+                    # parent_id was computed above and is still valid because the
+                    # topological order guarantees parents are processed first.
+                    g.puppet_group_id = await self._puppet.create_node_group(
+                        g.name, g.description, environment=g.environment,
+                        parent_id=parent_id, match_type=g.match_type, rules=g.rules,
+                        pinned_certnames=certnames,
+                    ) or None
+                if g.puppet_group_id:
+                    pe_ids[g.name] = g.puppet_group_id
+            except Exception as e:
+                puppet_ok = False
+                logger.warning("Puppet sync failed for '%s': %s", g.name, e)
+            # A configured master that produced no group id means the push was a
+            # silent no-op — don't let it masquerade as a successful sync.
+            if puppet_ready and not g.puppet_group_id:
+                puppet_ok = False
+            elif g.puppet_group_id:
+                pushed += 1
+            g.puppet_synced = puppet_ok
+            g.updated_at = datetime.utcnow()
+            await self._repo.update(g)
+            if puppet_ok:
+                synced += 1
+            else:
+                failed += 1
+
+        return {
+            "groups_total": len(groups),
+            "groups_synced": synced,
+            "groups_failed": failed,
+            "groups_skipped": skipped,
+            "groups_removed": removed,
+            "groups_pushed": pushed,
+            "nodes_classified": total_nodes,
+            "puppet_configured": puppet_ready,
+        }
+
+    async def _sync_core(self, groups) -> dict:
+        """Puppet Core sync: classify nodes via the External Node Classifier.
+
+        Builds one ENC document per managed node — its environment, every group
+        it belongs to (``sabc_groups``) and the most-specific bound InSpec
+        profile — and pushes the data to the master over SSH.
+
+        No RBAC token, no Node Classifier API: nothing here calls a Puppet
+        Enterprise-only endpoint.
+        """
+        by_name: dict[str, NodeGroup] = {g.name: g for g in groups}
+
+        def depth(g: NodeGroup) -> int:
+            d, seen, cur = 0, set(), g
+            while cur and cur.parent in by_name and cur.parent not in seen:
+                seen.add(cur.parent)
+                cur = by_name[cur.parent]
+                d += 1
+            return d
+
+        ordered = sorted(groups, key=depth)  # shallow → deep
+        resolved = {g.id: await resolve_matching(g, self._node_repo) for g in groups}
+        total_nodes = sum(len(resolved[g.id]["ids"]) for g in groups)
+
+        # Accumulate per-certname classification. Processing shallow→deep means a
+        # deeper (more specific) group overrides the environment and InSpec
+        # profile, while a child without its own profile inherits the parent's.
+        classmap: dict[str, dict] = {}
+        for g in ordered:
+            for cn in resolved[g.id]["certnames"]:
+                entry = classmap.setdefault(cn, {
+                    "certname": cn,
+                    "environment": g.environment or "production",
+                    "groups": [],
+                    "inspec_profile": None,
+                    "package_repo": None,
+                })
+                entry["groups"].append(g.name)
+                if g.environment:
+                    entry["environment"] = g.environment
+                if g.inspec_profile_id:
+                    entry["inspec_profile"] = g.inspec_profile_id
+                # Deepest group with an enabled repo wins (same override order).
+                if (g.package_repo or {}).get("enabled") and (g.package_repo or {}).get("url"):
+                    entry["package_repo"] = g.package_repo
+
+        classifications = list(classmap.values())
+
+        # Deploy the ENC data to the Puppet Core master.
+        core_ready = False
+        deployed = 0
+        try:
+            core_ready = bool(self._core) and await self._core.is_configured()
+        except Exception as e:
+            logger.warning("Puppet Core readiness check failed: %s", e)
+        if core_ready:
+            try:
+                res = await self._core.apply_classification(classifications)
+                deployed = res.get("deployed", 0)
+                for g in groups:
+                    g.puppet_synced = True
+                    g.updated_at = datetime.utcnow()
+                    await self._repo.update(g)
+            except Exception as e:
+                logger.warning("Puppet Core ENC deploy failed: %s", e)
+        else:
+            logger.info("Puppet Core master not configured — ENC deploy skipped.")
+
+        return {
+            "edition": "core",
+            "groups_total": len(groups),
+            "nodes_classified": total_nodes,
+            "enc_nodes_deployed": deployed,
+            "puppet_configured": core_ready,
+        }
+
+
+class CreateNodeGroupUseCase:
+    def __init__(self, repo, node_repo, puppet_client):
+        self._repo = repo
+        self._node_repo = node_repo
+        self._puppet = puppet_client
+
+    async def execute(self, data: dict) -> NodeGroup:
+        name = (data.get("name") or "").strip()
+        if not name:
+            raise ValidationError("name is required")
+        if await self._repo.find_by_name(name):
+            raise ConflictError(f"Node group '{name}' already exists")
+        _validate(data)
+        now = datetime.utcnow()
+        group = NodeGroup(
+            id=str(uuid.uuid4()),
+            name=name,
+            description=data.get("description"),
+            parent=data.get("parent") or "All Nodes",
+            environment=data.get("environment") or "production",
+            is_environment_group=bool(data.get("is_environment_group")),
+            match_type=data.get("match_type") or "all",
+            rules=data.get("rules") or [],
+            node_ids=[],
+            inspec_profile_id=data.get("inspec_profile_id"),
+            created_at=now,
+            updated_at=now,
+        )
+        await self._repo.save(group)
+        # Pin nodes selected during creation
+        for nid in (data.get("node_ids") or []):
+            await self._repo.add_node(group.id, nid)
+        group.node_ids = list(data.get("node_ids") or [])
+        await self._sync(group, parent_id=await self._parent_id(group.parent))
+        return group
+
+    async def _parent_id(self, parent_name: str):
+        if not parent_name or parent_name == "All Nodes":
+            return None
+        parent = await self._repo.find_by_name(parent_name)
+        return parent.puppet_group_id if parent else None
+
+    async def _sync(self, group: NodeGroup, parent_id=None) -> None:
+        resolved = await resolve_matching(group, self._node_repo)
+        puppet_ok = True
+        puppet_gid = group.puppet_group_id or ""
+        try:
+            puppet_gid = await self._puppet.create_node_group(
+                group.name, group.description,
+                environment=group.environment, parent_id=parent_id,
+                match_type=group.match_type, rules=group.rules,
+                pinned_certnames=resolved["certnames"],
+            )
+        except Exception as e:
+            puppet_ok = False
+            logger.warning("Puppet NC group sync failed: %s", e)
+        group.puppet_synced = puppet_ok
+        group.puppet_group_id = puppet_gid or None
+        group.updated_at = datetime.utcnow()
+        await self._repo.update(group)
+
+
+class UpdateNodeGroupUseCase:
+    def __init__(self, repo, node_repo, puppet_client):
+        self._repo = repo
+        self._node_repo = node_repo
+        self._puppet = puppet_client
+
+    async def execute(self, group_id: str, data: dict) -> NodeGroup:
+        group = await self._repo.find_by_id(group_id)
+        if not group:
+            raise NotFoundError(f"Node group '{group_id}' not found")
+        _validate(data)
+        if "description" in data:
+            group.description = data["description"]
+        if "environment" in data and data["environment"]:
+            group.environment = data["environment"]
+        if "parent" in data and data["parent"]:
+            group.parent = data["parent"]
+        if "is_environment_group" in data:
+            group.is_environment_group = bool(data["is_environment_group"])
+        if "match_type" in data and data["match_type"]:
+            group.match_type = data["match_type"]
+        if "rules" in data:
+            group.rules = data["rules"] or []
+        if "inspec_profile_id" in data:
+            group.inspec_profile_id = data["inspec_profile_id"] or None
+        if "active_response_enabled" in data:
+            group.active_response_enabled = bool(data["active_response_enabled"])
+        if "package_repo" in data:
+            group.package_repo = data["package_repo"] or {}
+        if "node_ids" in data:
+            current = set(group.node_ids)
+            wanted = set(data["node_ids"] or [])
+            for nid in wanted - current:
+                await self._repo.add_node(group_id, nid)
+            for nid in current - wanted:
+                await self._repo.remove_node(group_id, nid)
+            group.node_ids = list(wanted)
+        group.updated_at = datetime.utcnow()
+        await self._repo.update(group)
+        await self._resync(group)
+        return group
+
+    async def _parent_id(self, parent_name: str):
+        if not parent_name or parent_name == "All Nodes":
+            return None
+        parent = await self._repo.find_by_name(parent_name)
+        return parent.puppet_group_id if parent else None
+
+    async def _resync(self, group: NodeGroup) -> None:
+        resolved = await resolve_matching(group, self._node_repo)
+        parent_id = await self._parent_id(group.parent)
+        puppet_ok = True
+        try:
+            if group.puppet_group_id:
+                found = await self._puppet.update_node_group(
+                    group.puppet_group_id, name=group.name, description=group.description,
+                    environment=group.environment, parent_id=parent_id,
+                    match_type=group.match_type,
+                    rules=group.rules, pinned_certnames=resolved["certnames"],
+                )
+                if not found:
+                    logger.info("PE group '%s' stale — recreating", group.name)
+                    group.puppet_group_id = None
+            if not group.puppet_group_id:
+                group.puppet_group_id = await self._puppet.create_node_group(
+                    group.name, group.description, environment=group.environment,
+                    parent_id=parent_id, match_type=group.match_type, rules=group.rules,
+                    pinned_certnames=resolved["certnames"],
+                ) or None
+        except Exception as e:
+            puppet_ok = False
+            logger.warning("Puppet NC group re-sync failed: %s", e)
+        group.puppet_synced = puppet_ok
+        await self._repo.update(group)
+
+
+class DeleteNodeGroupUseCase:
+    def __init__(self, repo, puppet_client):
+        self._repo = repo
+        self._puppet = puppet_client
+
+    async def execute(self, group_id: str) -> dict:
+        group = await self._repo.find_by_id(group_id)
+        if not group:
+            raise NotFoundError(f"Node group '{group_id}' not found")
+        if group.group_type == "system":
+            raise ForbiddenError(f"System group '{group.name}' cannot be deleted")
+        try:
+            await self._puppet.delete_node_group(group.puppet_group_id or "")
+        except Exception as e:
+            logger.warning("Puppet NC delete group failed: %s", e)
+        await self._repo.delete(group_id)
+        return {"message": f"Node group '{group.name}' deleted"}
+
+
+class ListNodeGroupsUseCase:
+    def __init__(self, repo, node_repo=None):
+        self._repo = repo
+        self._node_repo = node_repo
+
+    async def execute(self) -> list[tuple[NodeGroup, list[str]]]:
+        groups = await self._repo.find_all()
+        out = []
+        for g in groups:
+            matching = []
+            if self._node_repo:
+                matching = (await resolve_matching(g, self._node_repo))["ids"]
+            out.append((g, matching))
+        return out
+
+
+class GetNodeGroupUseCase:
+    def __init__(self, repo, node_repo=None):
+        self._repo = repo
+        self._node_repo = node_repo
+
+    async def execute(self, gid: str) -> tuple[NodeGroup, list[str]]:
+        g = await self._repo.find_by_id(gid)
+        if not g:
+            raise NotFoundError(f"Node group '{gid}' not found")
+        matching = []
+        if self._node_repo:
+            matching = (await resolve_matching(g, self._node_repo))["ids"]
+        return g, matching
+
+
+class ApplyGroupPackageRepoUseCase:
+    """Configure the group's package repository on each member node via Ansible.
+
+    Works with no Puppet master — it launches one configure_package_repo.yml job
+    per member. When the group has no enabled repo, the server default
+    (default_package_repo_url) is used; when that is also unset, the node's OS
+    defaults are left untouched.
+    """
+    def __init__(self, repo, node_repo, start_job_uc, config_repo=None):
+        self._repo = repo
+        self._node_repo = node_repo
+        self._start = start_job_uc
+        self._config = config_repo
+
+    async def execute(self, group_id: str) -> dict:
+        group = await self._repo.find_by_id(group_id)
+        if not group:
+            raise NotFoundError(f"Node group '{group_id}' not found")
+        node_ids = (await resolve_matching(group, self._node_repo))["ids"]
+        if not node_ids:
+            return {"group": group.name, "requested": 0, "jobs": [],
+                    "message": f"Group '{group.name}' has no member nodes."}
+
+        default_url = ""
+        if self._config:
+            try:
+                default_url = (await self._config.get("default_package_repo_url")) or ""
+            except Exception:
+                default_url = ""
+        if not default_url:
+            from config import get_settings
+            default_url = get_settings().default_package_repo_url or ""
+
+        extra_vars = {"repo": group.package_repo or {}, "default_repo_url": default_url}
+        jobs = []
+        for nid in node_ids:
+            job = await self._start.execute({
+                "type": "configure_package_repo",
+                "node_id": nid,
+                "playbook": "configure_package_repo.yml",
+                "extra_vars": extra_vars,
+            })
+            jobs.append({"node_id": nid, "job_id": job.id})
+        return {"group": group.name, "requested": len(node_ids), "jobs": jobs}
+
+
+class ListFactsUseCase:
+    """Expose available facts and their distinct values for the rule builder."""
+    def __init__(self, node_repo):
+        self._node_repo = node_repo
+
+    async def execute(self) -> list[dict]:
+        nodes = await self._node_repo.find_all({})
+        facts = []
+        for fact in FACT_ATTRS:
+            values = set()
+            for n in nodes:
+                v = _node_value(n, fact)
+                if isinstance(v, (list, tuple)):
+                    values.update(str(x) for x in v)
+                elif isinstance(v, bool):
+                    values.add("true" if v else "false")
+                elif v not in (None, ""):
+                    values.add(str(v))
+            facts.append({"name": fact, "values": sorted(values)[:50]})
+        return facts
+
+
+class PreviewMatchingUseCase:
+    """Resolve which registered nodes a candidate rule set would match (live)."""
+    def __init__(self, node_repo):
+        self._node_repo = node_repo
+
+    async def execute(self, data: dict) -> list[str]:
+        _validate(data)
+        tmp = NodeGroup(
+            id="preview", name="preview",
+            match_type=data.get("match_type") or "all",
+            rules=data.get("rules") or [],
+            node_ids=data.get("node_ids") or [],
+        )
+        return (await resolve_matching(tmp, self._node_repo))["ids"]
+
+
+class AddNodeToGroupUseCase:
+    def __init__(self, repo, node_repo):
+        self._repo = repo
+        self._node_repo = node_repo
+
+    async def execute(self, group_id: str, node_id: str) -> dict:
+        g = await self._repo.find_by_id(group_id)
+        if not g:
+            raise NotFoundError(f"Node group '{group_id}' not found")
+        n = await self._node_repo.find_by_id(node_id)
+        if not n:
+            raise NotFoundError(f"Node '{node_id}' not found")
+        await self._repo.add_node(group_id, node_id)
+        return {"message": f"Node '{n.hostname}' added to group '{g.name}'"}
+
+
+class RemoveNodeFromGroupUseCase:
+    def __init__(self, repo, node_repo):
+        self._repo = repo
+        self._node_repo = node_repo
+
+    async def execute(self, group_id: str, node_id: str) -> dict:
+        g = await self._repo.find_by_id(group_id)
+        if not g:
+            raise NotFoundError(f"Node group '{group_id}' not found")
+        await self._repo.remove_node(group_id, node_id)
+        return {"message": f"Node removed from group '{g.name}'"}

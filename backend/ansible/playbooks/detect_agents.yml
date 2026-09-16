@@ -1,0 +1,97 @@
+---
+# Read-only agent enrollment detection.
+# Uses only "raw" tasks so no Python interpreter is needed on the managed
+# node — this makes it compatible with legacy distributions such as
+# RHEL/AlmaLinux 8 that ship Python 3.6 (Ansible-core 2.17+ generates
+# wrapper code that requires Python 3.7+, breaking the "setup" and "shell"
+# modules on those hosts).
+#
+# The platform backend parses two sentinel strings in the job log:
+#   PUPPET_STATUS=ENROLLED     → sets puppet_enrolled    = True
+#   DETECTION_STATUS=ENROLLED  → sets detection_enrolled = True
+#
+# Any other output is informational for troubleshooting.
+#
+- name: Detect Agent Enrollment
+  hosts: target
+  become: yes
+  gather_facts: no
+
+  tasks:
+
+    - name: "══ AGENT ENROLLMENT DETECTION ═══════════════════════════════════"
+      raw: "echo \"Checking $(hostname -f) on $(. /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\" || uname -r)\""
+
+    # ── Puppet ────────────────────────────────────────────────────────────────
+    - name: Detect Puppet agent enrollment
+      raw: |
+        PUPPET=/opt/puppetlabs/puppet/bin/puppet
+        CERTDIR=/etc/puppetlabs/puppet/ssl/certs
+        if ! test -f "${PUPPET}"; then
+          echo "PUPPET_STATUS=NOT_ENROLLED"
+          echo "  Reason: puppet binary not found at ${PUPPET}"
+          echo "  (Puppet agent is not installed on this node)"
+        else
+          VER=$("${PUPPET}" --version 2>/dev/null || echo "unknown")
+          CERT=$(find "${CERTDIR}" -maxdepth 1 -name '*.pem' ! -name 'ca.pem' 2>/dev/null | head -1)
+          if [ -n "${CERT}" ]; then
+            echo "PUPPET_STATUS=ENROLLED"
+            echo "  Version  : ${VER}"
+            echo "  Cert file: $(basename ${CERT})"
+            echo "  Service  : $(systemctl is-active puppet 2>/dev/null || echo 'unknown')"
+          else
+            echo "PUPPET_STATUS=NOT_ENROLLED"
+            echo "  Reason : Puppet ${VER} installed but no signed cert in ${CERTDIR}/"
+            echo "  (Agent installed but not enrolled with a Puppet master)"
+          fi
+        fi
+      register: puppet_detection
+      changed_when: false
+      failed_when: false
+
+    - name: Puppet detection result
+      debug:
+        msg: "{{ puppet_detection.stdout_lines }}"
+
+    # ── Detection agent ───────────────────────────────────────────────────────
+    - name: Detect compliance detection agent enrollment
+      raw: |
+        AGENT=/usr/local/lib/compliance-agent/agent.py
+        CONF=/etc/compliance-agent/config.yaml
+        UNIT=compliance-detection-agent
+        if ! test -f "${AGENT}"; then
+          echo "DETECTION_STATUS=NOT_ENROLLED"
+          echo "  Reason: agent not found at ${AGENT}"
+          echo "  (The compliance detection agent is not installed on this node)"
+        elif ! test -f "${CONF}"; then
+          echo "DETECTION_STATUS=NOT_ENROLLED"
+          echo "  Reason : agent present but ${CONF} is missing"
+          echo "  (Broken install — re-run the detection agent install job)"
+        else
+          SVC=$(systemctl is-active "${UNIT}" 2>/dev/null || echo unknown)
+          GW=$(grep -E '^[[:space:]]*url:' "${CONF}" 2>/dev/null | head -1 | awk '{print $2}')
+          if [ "${SVC}" = "active" ]; then
+            echo "DETECTION_STATUS=ENROLLED"
+            echo "  Service : ${SVC}"
+            echo "  Gateway : ${GW:-unknown}"
+          else
+            echo "DETECTION_STATUS=NOT_ENROLLED"
+            echo "  Service : ${SVC}"
+            echo "  Gateway : ${GW:-unknown}"
+            echo "  Reason  : agent installed but the ${UNIT} service is not active"
+            journalctl -u "${UNIT}" -n 5 --no-pager 2>/dev/null | sed 's/^/    /'
+          fi
+        fi
+      register: detection_detection
+      changed_when: false
+      failed_when: false
+
+    - name: Detection agent result
+      debug:
+        msg: "{{ detection_detection.stdout_lines }}"
+
+    - name: "══ DETECTION COMPLETE ═══════════════════════════════════════════"
+      debug:
+        msg:
+          - "Puppet    : {{ (puppet_detection.stdout_lines | select('match', 'PUPPET_STATUS=.*') | list | first) | default('unknown') }}"
+          - "Detection : {{ (detection_detection.stdout_lines | select('match', 'DETECTION_STATUS=.*') | list | first) | default('unknown') }}"

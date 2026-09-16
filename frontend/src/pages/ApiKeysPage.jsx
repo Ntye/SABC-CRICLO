@@ -1,0 +1,312 @@
+import { useState, useMemo } from 'react'
+import { Key, Plus, Trash2, Search } from 'lucide-react'
+import {
+  createApiKey,
+  listApiKeys,
+  revokeApiKey,
+} from '../lib/api.js'
+import { useApi } from '../hooks/useApi.js'
+import { useToast } from '../context/ToastContext.jsx'
+import { useT } from '../context/LangContext.jsx'
+import { badge } from '../lib/tw.js'
+import ConfirmDialog from '../components/common/ConfirmDialog.jsx'
+import EmptyState from '../components/common/EmptyState.jsx'
+import Spinner from '../components/common/Spinner.jsx'
+import Pagination from '../components/Pagination.jsx'
+import { usePagination } from '../hooks/usePagination.js'
+
+function relativeTime(iso, t) {
+  if (!iso) return '—'
+  const diff = Date.now() - new Date(iso).getTime()
+  const s = Math.floor(diff / 1000)
+  if (s < 60) return t('common.justNow')
+  const m = Math.floor(s / 60)
+  if (m < 60) return t('common.minutesAgo', { n: m })
+  const h = Math.floor(m / 60)
+  if (h < 24) return t('common.hoursAgo', { n: h })
+  return new Date(iso).toLocaleDateString()
+}
+
+// Date -> value for <input type="datetime-local"> (local wall-clock, minutes).
+function toLocalInput(date) {
+  const d = new Date(date.getTime() - date.getTimezoneOffset() * 60000)
+  return d.toISOString().slice(0, 16)
+}
+
+// Badge style + label per effective key status.
+const STATUS_META = {
+  active:  { badge: 'success', key: 'keys.statusActive' },
+  pending: { badge: 'warning', key: 'keys.statusPending' },
+  expired: { badge: 'gray',    key: 'keys.statusExpired' },
+  revoked: { badge: 'gray',    key: 'keys.statusRevoked' },
+}
+
+export default function ApiKeysPage() {
+  const t = useT()
+  const toast = useToast()
+  const { data: keys, loading, error, refetch } = useApi(listApiKeys)
+
+  const [name, setName] = useState('')
+  const [role, setRole] = useState('readonly')
+  // Temporal window — defaults: valid from now until 90 days out.
+  const [startsAt, setStartsAt] = useState(() => toLocalInput(new Date()))
+  const [expiresAt, setExpiresAt] = useState(() => {
+    const d = new Date(); d.setDate(d.getDate() + 90); return toLocalInput(d)
+  })
+  const [creating, setCreating] = useState(false)
+  const [newKey, setNewKey] = useState(null)
+
+  const [revokeTarget, setRevokeTarget] = useState(null)
+  const [revoking, setRevoking] = useState(false)
+
+  // Filter state
+  const [query, setQuery] = useState('')
+  const [roleFilter, setRoleFilter] = useState('all')
+  const [statusFilter, setStatusFilter] = useState('all')
+
+  const filtered = useMemo(() => {
+    if (!keys) return []
+    const q = query.toLowerCase()
+    return keys.filter((k) => {
+      if (roleFilter !== 'all' && k.role !== roleFilter) return false
+      if (statusFilter === 'active' && !k.active) return false
+      if (statusFilter === 'revoked' && k.active) return false
+      if (q && !k.name.toLowerCase().includes(q)) return false
+      return true
+    })
+  }, [keys, query, roleFilter, statusFilter])
+  const pager = usePagination(filtered)
+
+  async function handleCreate(e) {
+    e.preventDefault()
+    if (!name.trim()) return
+    if (!expiresAt) { toast(t('keys.needExpiry'), 'error'); return }
+    if (startsAt && expiresAt && expiresAt <= startsAt) {
+      toast(t('keys.badWindow'), 'error'); return
+    }
+    setCreating(true)
+    try {
+      const result = await createApiKey(name.trim(), role, {
+        startsAt: startsAt || null,
+        expiresAt: expiresAt || null,
+      })
+      setNewKey(result)
+      setName('')
+      setRole('readonly')
+      refetch()
+      toast(t('keys.created'), 'success')
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  async function handleRevoke() {
+    if (!revokeTarget) return
+    setRevoking(true)
+    try {
+      await revokeApiKey(revokeTarget.id)
+      setRevokeTarget(null)
+      refetch()
+      toast(t('keys.revoked'), 'success')
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setRevoking(false)
+    }
+  }
+
+  return (
+    <div className="p-6 max-w-4xl">
+      <h2 className="text-[18px] font-semibold text-gray-900 mb-6">{t('keys.title')}</h2>
+
+      {/* Create form */}
+      <div className="bg-white rounded-xl border border-gray-100 p-5 mb-6 max-w-lg">
+        <h3 className="text-[13px] font-semibold text-gray-700 mb-4">{t('keys.createTitle')}</h3>
+        <form onSubmit={handleCreate} className="space-y-3">
+          <div>
+            <label className="block text-[11px] font-medium text-gray-500 mb-1">{t('keys.name')}</label>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={t('keys.namePlaceholder')}
+              className="w-full px-3 py-2 text-[13px] border border-gray-200 rounded-lg outline-none focus:border-brand focus:ring-2 focus:ring-brand/15"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-gray-500 mb-1">{t('keys.role')}</label>
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+              className="w-full px-3 py-2 text-[13px] border border-gray-200 rounded-lg outline-none focus:border-brand bg-white"
+            >
+              <option value="readonly">readonly</option>
+              <option value="operator">operator</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+          {/* Temporal validity window — the key auto-revokes at the end date */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-medium text-gray-500 mb-1">{t('keys.startsAt')}</label>
+              <input
+                type="datetime-local"
+                value={startsAt}
+                onChange={(e) => setStartsAt(e.target.value)}
+                className="w-full px-3 py-2 text-[13px] border border-gray-200 rounded-lg outline-none focus:border-brand focus:ring-2 focus:ring-brand/15"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-medium text-gray-500 mb-1">{t('keys.expiresAt')}</label>
+              <input
+                type="datetime-local"
+                value={expiresAt}
+                min={startsAt || undefined}
+                onChange={(e) => setExpiresAt(e.target.value)}
+                className="w-full px-3 py-2 text-[13px] border border-gray-200 rounded-lg outline-none focus:border-brand focus:ring-2 focus:ring-brand/15"
+              />
+            </div>
+          </div>
+          <p className="text-[11px] text-gray-400 -mt-1">{t('keys.windowHint')}</p>
+          <button
+            type="submit"
+            disabled={creating || !name.trim()}
+            className="inline-flex items-center gap-1.5 px-4 py-2 bg-brand text-white text-[13px] font-medium rounded-lg hover:bg-brand/90 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {creating ? <Spinner size={13} /> : <Plus size={13} />}
+            {creating ? t('keys.creating') : t('keys.createBtn')}
+          </button>
+        </form>
+
+        {/* New key created — key value is not shown for security */}
+        {newKey && (
+          <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded-lg">
+            <p className="text-[11px] font-medium text-green-800">
+              {t('keys.createSuccess', { name: newKey.name })}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Filter bar */}
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        <div className="flex items-center gap-2 px-3 py-1.5 bg-white border border-gray-200 rounded-lg flex-1 min-w-[160px] max-w-[280px]">
+          <Search size={13} className="text-gray-400 flex-shrink-0" />
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search keys…"
+            className="flex-1 text-[12px] outline-none bg-transparent text-gray-700 placeholder-gray-400"
+          />
+        </div>
+        <select
+          value={roleFilter}
+          onChange={(e) => setRoleFilter(e.target.value)}
+          className="px-3 py-1.5 text-[12px] bg-white border border-gray-200 rounded-lg outline-none focus:border-brand text-gray-700"
+        >
+          <option value="all">All roles</option>
+          <option value="readonly">readonly</option>
+          <option value="operator">operator</option>
+          <option value="admin">admin</option>
+        </select>
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+          className="px-3 py-1.5 text-[12px] bg-white border border-gray-200 rounded-lg outline-none focus:border-brand text-gray-700"
+        >
+          <option value="all">All statuses</option>
+          <option value="active">Active</option>
+          <option value="revoked">Revoked</option>
+        </select>
+        {(query || roleFilter !== 'all' || statusFilter !== 'all') && (
+          <button
+            onClick={() => { setQuery(''); setRoleFilter('all'); setStatusFilter('all') }}
+            className="text-[11px] text-gray-400 hover:text-gray-600 px-2 py-1.5"
+          >
+            Clear
+          </button>
+        )}
+      </div>
+
+      {/* Table */}
+      <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
+        {loading && (
+          <div className="p-6 space-y-3">
+            {[1, 2, 3].map((i) => <div key={i} className="h-8 bg-gray-100 animate-pulse rounded" />)}
+          </div>
+        )}
+        {error && (
+          <div className="p-4 border border-red-200 bg-red-50 rounded-lg m-4">
+            <p className="text-[12px] text-red-600">{error}</p>
+          </div>
+        )}
+        {!loading && !error && keys && (
+          keys.length === 0 ? (
+            <EmptyState icon={Key} title={t('keys.noKeys')} description={t('keys.noKeysDesc')} />
+          ) : filtered.length === 0 ? (
+            <div className="p-8 text-center text-[13px] text-gray-400">No keys match the filters.</div>
+          ) : (
+            <>
+            <table className="w-full text-[13px]">
+              <thead>
+                <tr className="border-b border-gray-100">
+                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">{t('keys.colName')}</th>
+                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">{t('keys.colRole')}</th>
+                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">{t('keys.colStatus')}</th>
+                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">{t('keys.colExpires')}</th>
+                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">{t('keys.colLastUsed')}</th>
+                  <th className="text-left px-4 py-3 text-[11px] font-semibold text-gray-400 uppercase tracking-wider">{t('keys.colCreated')}</th>
+                  <th className="px-4 py-3" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-50">
+                {pager.pageItems.map((k) => (
+                  <tr key={k.id} className="hover:bg-gray-50/50">
+                    <td className="px-4 py-3 font-medium">{k.name}</td>
+                    <td className="px-4 py-3"><span className={badge(k.role)}>{k.role}</span></td>
+                    <td className="px-4 py-3">
+                      {(() => {
+                        const meta = STATUS_META[k.status] || STATUS_META[k.active ? 'active' : 'revoked']
+                        return <span className={badge(meta.badge)}>{t(meta.key)}</span>
+                      })()}
+                    </td>
+                    <td className="px-4 py-3 text-gray-400 text-[12px]">
+                      {k.expires_at ? new Date(k.expires_at).toLocaleString() : t('keys.noExpiry')}
+                    </td>
+                    <td className="px-4 py-3 text-gray-400 text-[12px]">{relativeTime(k.last_used, t)}</td>
+                    <td className="px-4 py-3 text-gray-400 text-[12px]">{relativeTime(k.created_at, t)}</td>
+                    <td className="px-4 py-3 text-right">
+                      {k.status !== 'revoked' && (
+                        <button
+                          onClick={() => setRevokeTarget(k)}
+                          className="p-1.5 text-gray-400 hover:text-red-500 rounded hover:bg-red-50 transition-colors"
+                          title={t('keys.revoke')}
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <Pagination {...pager} />
+            </>
+          )
+        )}
+      </div>
+
+      <ConfirmDialog
+        open={!!revokeTarget}
+        title={t('keys.revokeTitle')}
+        message={t('keys.revokeMsg', { name: revokeTarget?.name ?? '' })}
+        confirmLabel={revoking ? t('keys.revoking') : t('keys.revoke')}
+        danger
+        onConfirm={handleRevoke}
+        onCancel={() => setRevokeTarget(null)}
+      />
+    </div>
+  )
+}

@@ -1,0 +1,862 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════════
+# SABC Compliance Platform — EC2 Deployment Script
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Usage:
+#   ./deploy/ship.sh user@ec2-ip                Build, transfer, and deploy
+#   ./deploy/ship.sh user@ec2-ip --setup        First time: install Docker + deploy
+#   ./deploy/ship.sh user@ec2-ip --update       Transfer and restart (skip build)
+#   ./deploy/ship.sh user@ec2-ip --deploy-only  Load + restart only (skip build & transfer)
+#   ./deploy/ship.sh user@ec2-ip --rollback     Roll back to the previous deployment
+#   ./deploy/ship.sh --build-only               Build and save images locally
+#   ./deploy/ship.sh --bundle                   Build bundled image (with airgap packages)
+#
+# Partial service updates (faster — only rebuilds and restarts one container):
+#   ./deploy/ship.sh user@ec2-ip --backend-only          Rebuild and redeploy only the backend
+#   ./deploy/ship.sh user@ec2-ip --frontend-only         Rebuild and redeploy only the frontend
+#   ./deploy/ship.sh user@ec2-ip --update --backend-only Transfer existing archive, restart backend
+#   ./deploy/ship.sh user@ec2-ip --update --frontend-only Transfer existing archive, restart frontend
+#
+# Offline AI assistant (Ollama):
+#   Opt in with --with-ai to bake the LLM model into the archive. The model is
+#   downloaded ONCE on this (internet-connected) build machine and committed into
+#   an image layer — the server needs no internet at all.
+#
+#   ./deploy/ship.sh user@ec2-ip --with-ai                 embed the default model (llama3.2:3b)
+#   OLLAMA_MODEL=llama3.2:3b ./deploy/ship.sh ... --with-ai  embed a larger model
+#
+#   Without --with-ai the assistant image is not built/shipped and the chat
+#   widget simply shows "offline" — everything else works normally.
+# What it does:
+#   1. Builds Docker images on your local machine
+#   2. Saves them to deploy/sabc-images.tar.gz (~200MB compressed)
+#   3. Transfers the archive + compose file + .env to the EC2 instance
+#   4. Loads images and starts the platform with docker compose
+#   5. Auto-migrates a legacy SQLite database to PostgreSQL on first deploy
+#      (runs once, before the backend boots; a marker file skips it thereafter)
+#
+# Prerequisites:
+#   - Docker + Docker Compose on your local machine
+#   - SSH access to the EC2 instance (key-based recommended)
+#   - EC2 security group: inbound port 80 (HTTP), port 22 (SSH)
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ARCHIVE="$SCRIPT_DIR/sabc-images.tar.gz"
+REMOTE_DIR="/opt/sabc-compliance"
+# Persistent cache of packaged stock-image tars (postgres/ollama/alpine) so they
+# are pulled+exported once, not on every build. Override with SABC_IMAGE_CACHE.
+IMAGE_CACHE="${SABC_IMAGE_CACHE:-$SCRIPT_DIR/.image-cache}"
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+TARGET=""
+DO_SETUP=false
+DO_UPDATE=false
+DEPLOY_ONLY=false
+BUILD_ONLY=false
+BUNDLE=false
+DO_ROLLBACK=false
+WITH_AI=false          # pull model on this machine; archive for server
+AI_MODELS=""           # path to a pre-downloaded model archive (from get-model.sh)
+BACKEND_ONLY=false     # rebuild/transfer/restart only the backend service
+FRONTEND_ONLY=false    # rebuild/transfer/restart only the frontend service
+
+for arg in "$@"; do
+  case "$arg" in
+    --setup)            DO_SETUP=true ;;
+    --update)           DO_UPDATE=true ;;
+    --deploy-only)      DEPLOY_ONLY=true ;;
+    --build-only)       BUILD_ONLY=true ;;
+    --bundle)           BUNDLE=true ;;
+    --rollback)         DO_ROLLBACK=true ;;
+    --with-ai)          WITH_AI=true ;;
+    --ai-models=*)      AI_MODELS="${arg#--ai-models=}" ;;
+    --backend-only)     BACKEND_ONLY=true ;;
+    --frontend-only)    FRONTEND_ONLY=true ;;
+    -*)                 echo "Unknown flag: $arg"; exit 1 ;;
+    *)                  TARGET="$arg" ;;
+  esac
+done
+
+if [[ "$BACKEND_ONLY" == true && "$FRONTEND_ONLY" == true ]]; then
+  fail "--backend-only and --frontend-only cannot be combined"
+fi
+
+if [[ -z "$TARGET" && "$BUILD_ONLY" == false && "$BUNDLE" == false ]]; then
+  echo "Usage: ./deploy/ship.sh user@ec2-ip [--setup|--update|--deploy-only|--rollback|--build-only|--bundle] [--with-ai] [--backend-only|--frontend-only]"
+  exit 1
+fi
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+info()  { echo -e "\033[1;34m▸\033[0m $*"; }
+ok()    { echo -e "\033[1;32m✓\033[0m $*"; }
+warn()  { echo -e "\033[1;33m⚠\033[0m $*"; }
+fail()  { echo -e "\033[1;31m✗\033[0m $*"; exit 1; }
+
+remote() {
+  ssh -o StrictHostKeyChecking=no "$TARGET" "$@"
+}
+
+# docker on the remote may require sudo (user not yet in docker group)
+remote_docker() {
+  ssh -o StrictHostKeyChecking=no "$TARGET" "sudo $*"
+}
+
+# Package a stock image into a tar, REUSING a previously-built tar from a
+# persistent on-disk cache so we never re-pull/re-export on every build. Only
+# stock third-party images (postgres, ollama runtime, alpine) use this — the app
+# images (backend/frontend) are always rebuilt because their source changes.
+#
+# We export via `docker buildx build --output type=docker,dest=` (NOT
+# `docker save`): with Docker Desktop's containerd image store, `docker save`
+# of a freshly-pulled multi-arch image fails with "unable to create manifests
+# file: NotFound". buildx exports a self-contained, loadable archive directly.
+# Caching the resulting tar means the (one-time) pull only ever happens once.
+#   $1 = image ref (e.g. postgres:16-alpine)   $2 = tar filename (in $STAGE)
+package_or_reuse() {
+  local image="$1" tarname="$2"
+  mkdir -p "$IMAGE_CACHE"
+  local cached="$IMAGE_CACHE/$tarname"
+  if [[ -f "$cached" ]]; then
+    info "Reusing cached image archive $tarname (rm $cached to refresh)"
+  else
+    info "Packaging $image (linux/amd64) into cache ..."
+    local ctx; ctx="$(mktemp -d)"
+    echo "FROM $image" > "$ctx/Dockerfile"
+    docker buildx build --platform linux/amd64 -t "$image" \
+      --output "type=docker,dest=$cached" "$ctx"
+    rm -rf "$ctx"
+  fi
+  cp "$cached" "$STAGE/$tarname"
+}
+
+# ── Step 1: Build images ────────────────────────────────────────────────────
+build_images() {
+  info "Building Docker images for linux/amd64 ..."
+  cd "$PROJECT_DIR"
+
+  # Write each image straight to a docker-archive tar with
+  # `docker buildx build --output type=docker,dest=…` instead of building into
+  # the local image store and then running `docker save`.
+  #
+  # Why: on macOS Docker Desktop the containerd image store keeps the layers of
+  # a buildx cross-platform (--platform linux/amd64 on Apple Silicon) build out
+  # of the classic store, so `docker save` — and even `--load` followed by
+  # `docker save` — fails with:
+  #   unable to create manifests file: NotFound: content digest sha256:…: not found
+  # `--output type=docker,dest=FILE` exports the finished image as a fully
+  # self-contained, `docker load`-able archive directly from the build, so we
+  # never touch the broken save path at all.  docker-compose.yml has no build:
+  # contexts (those live only in docker-compose.dev.yml for local dev).
+  STAGE="$SCRIPT_DIR/.images"
+  rm -rf "$STAGE"
+  mkdir -p "$STAGE"
+
+  if [[ "$FRONTEND_ONLY" == false ]]; then
+    if [[ "$BUNDLE" == true ]]; then
+      # docker-compose.yml references sabc-compliance-backend:latest, so tag the
+      # bundled (airgap-packages) image :latest — otherwise the loaded image never
+      # matches the compose file and the backend fails with "image not found".
+      info "Building bundled backend image (with airgap packages) ..."
+      docker buildx build --platform linux/amd64 \
+        -f backend/Dockerfile.bundle -t sabc-compliance-backend:latest \
+        --output "type=docker,dest=$STAGE/backend.tar" backend/
+    else
+      info "Building backend image ..."
+      docker buildx build --platform linux/amd64 \
+        -t sabc-compliance-backend:latest \
+        --output "type=docker,dest=$STAGE/backend.tar" ./backend
+    fi
+  fi
+
+  if [[ "$BACKEND_ONLY" == false ]]; then
+    info "Building frontend image ..."
+    docker buildx build --platform linux/amd64 \
+      --build-arg VITE_API_BASE=/api \
+      -t sabc-compliance-frontend:latest \
+      --output "type=docker,dest=$STAGE/frontend.tar" ./frontend
+  fi
+
+  # ── Ollama runtime + model (offline AI assistant) ────────────────────────────
+  # --with-ai       : pull model on THIS machine then archive it for transfer
+  # --ai-models=TAR : use a pre-downloaded archive from deploy/get-model.sh
+  # Neither         : skip; chat widget degrades gracefully on the server
+  if [[ "$FRONTEND_ONLY" == false ]]; then
+    if [[ "$WITH_AI" == "true" || -n "$AI_MODELS" ]]; then
+      # Stock runtime + alpine — reused from the local image store if present.
+      package_or_reuse ollama/ollama:latest ollama-runtime.tar
+      package_or_reuse alpine:latest        alpine.tar
+
+      if [[ "$WITH_AI" == "true" ]]; then
+        local ollama_model="${OLLAMA_MODEL:-llama3.2:3b}"
+        if [[ -f "$SCRIPT_DIR/ollama-models.tar.gz" ]]; then
+          # Already downloaded on a previous run — don't pull gigabytes again.
+          ok "Reusing existing model archive: $SCRIPT_DIR/ollama-models.tar.gz"
+          info "(delete it to force a fresh download of '${ollama_model}')"
+        else
+          # Persistent cache so even a fresh archive build skips re-downloading
+          # blobs Ollama already has locally.
+          local cache_dir="${SABC_OLLAMA_CACHE:-$HOME/.cache/sabc-ollama}"
+          mkdir -p "$cache_dir"
+          info "Pulling Ollama model '${ollama_model}' (cache: $cache_dir) ..."
+          # No --platform here on purpose: model files are architecture-
+          # independent (just weights/blobs), so we reuse whatever ollama image
+          # is already present locally instead of pulling the amd64 variant just
+          # to download data. The amd64 *runtime* image is built+cached above.
+          # 'ollama pull' needs a running server, so start one in the background
+          # inside the container, wait until it answers, then pull.
+          docker run --rm \
+            -v "${cache_dir}:/root/.ollama" \
+            --entrypoint /bin/sh ollama/ollama:latest -c \
+            "ollama serve >/tmp/serve.log 2>&1 & for i in \$(seq 1 30); do ollama list >/dev/null 2>&1 && break; sleep 1; done; ollama pull '${ollama_model}'"
+          info "Archiving model files ..."
+          tar -czf "$SCRIPT_DIR/ollama-models.tar.gz" -C "$cache_dir" .
+          ok "Model archive: $SCRIPT_DIR/ollama-models.tar.gz"
+        fi
+      else
+        # Skip the copy when --ai-models already points at the destination
+        # (cp errors "are identical" otherwise).
+        ai_dest="$SCRIPT_DIR/ollama-models.tar.gz"
+        ai_src_real="$(cd "$(dirname "$AI_MODELS")" && pwd)/$(basename "$AI_MODELS")"
+        ai_dst_real="$(cd "$(dirname "$ai_dest")" && pwd)/$(basename "$ai_dest")"
+        if [[ "$ai_src_real" != "$ai_dst_real" ]]; then
+          cp "$AI_MODELS" "$ai_dest"
+        fi
+        ok "Using model archive: $AI_MODELS"
+      fi
+    else
+      info "Skipping offline AI assistant (pass --with-ai or --ai-models=<file> to include it)."
+    fi
+  fi
+
+  # postgres is only needed for full deploys — for partial updates the database
+  # container is already running on the server and must not be replaced.
+  if [[ "$BACKEND_ONLY" == false && "$FRONTEND_ONLY" == false ]]; then
+    package_or_reuse postgres:16-alpine postgres.tar
+  fi
+
+  ok "Image archives built (linux/amd64)"
+}
+
+# ── Step 2: Save images to archive ──────────────────────────────────────────
+save_images() {
+  info "Saving images to $ARCHIVE ..."
+
+  # build_images already exported each image as a self-contained, loadable
+  # docker-archive tar under $STAGE.  Bundle those per-image tars into the single
+  # gzipped artifact the rest of the pipeline ships.  For partial deploys only
+  # the relevant image(s) are included — postgres is omitted because the server
+  # has it running already and reloading it would restart the database.
+  local stage="$SCRIPT_DIR/.images"
+  local images=()
+  [[ "$FRONTEND_ONLY" == false ]] && images+=(backend.tar)
+  [[ "$BACKEND_ONLY" == false ]] && images+=(frontend.tar)
+  if [[ "$BACKEND_ONLY" == false && "$FRONTEND_ONLY" == false ]]; then
+    images+=(postgres.tar)
+    # Ollama runtime image (not the model — that is sent as a separate archive)
+    if [[ -f "$stage/ollama-runtime.tar" ]]; then
+      images+=(ollama-runtime.tar)
+      [[ -f "$stage/alpine.tar" ]] && images+=(alpine.tar)
+    fi
+  fi
+  tar -czf "$ARCHIVE" -C "$stage" "${images[@]}"
+  rm -rf "$stage"
+
+  local size
+  size=$(du -h "$ARCHIVE" | cut -f1)
+  ok "Archive ready: $ARCHIVE ($size)"
+}
+
+# ── Step 3: Install Docker on EC2 (first time only) ─────────────────────────
+setup_ec2() {
+  info "Installing Docker on $TARGET ..."
+  remote "sudo bash -s" << 'SETUP_EOF'
+set -e
+
+if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
+  echo "Docker already installed: $(docker --version)"
+  echo "Compose: $(docker compose version)"
+  exit 0
+fi
+
+echo "Installing Docker ..."
+
+# Detect OS
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+  OS=$ID
+else
+  echo "Cannot detect OS" && exit 1
+fi
+
+case "$OS" in
+  ubuntu|debian)
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl gnupg lsb-release
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "https://download.docker.com/linux/$OS/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+      https://download.docker.com/linux/$OS $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    ;;
+  amzn|rhel|centos|fedora)
+    yum install -y docker
+    systemctl enable docker
+    systemctl start docker
+    # Install compose plugin
+    COMPOSE_VERSION=$(curl -sSL https://api.github.com/repos/docker/compose/releases/latest | grep tag_name | cut -d '"' -f4)
+    mkdir -p /usr/local/lib/docker/cli-plugins
+    curl -sSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" \
+      -o /usr/local/lib/docker/cli-plugins/docker-compose
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+    ;;
+  *)
+    echo "Unsupported OS: $OS" && exit 1
+    ;;
+esac
+
+systemctl enable docker
+systemctl start docker
+
+# Allow current user to use docker without sudo
+if [ -n "${SUDO_USER:-}" ]; then
+  usermod -aG docker "$SUDO_USER"
+fi
+
+echo "Docker installed: $(docker --version)"
+echo "Compose: $(docker compose version)"
+SETUP_EOF
+
+  ok "Docker ready on $TARGET"
+}
+
+# ── Step 4: Transfer files to EC2 ───────────────────────────────────────────
+transfer() {
+  info "Creating remote directory $REMOTE_DIR ..."
+  remote "sudo mkdir -p $REMOTE_DIR && sudo chown \$(whoami):\$(whoami) $REMOTE_DIR"
+
+  info "Transferring images archive (this may take a few minutes) ..."
+  scp -o StrictHostKeyChecking=no "$ARCHIVE" "$TARGET:$REMOTE_DIR/sabc-images.tar.gz"
+
+  info "Transferring compose file and env ..."
+  scp -o StrictHostKeyChecking=no "$PROJECT_DIR/docker-compose.yml" "$TARGET:$REMOTE_DIR/"
+
+  # Transfer .env if it exists, otherwise create a default
+  if [ -f "$PROJECT_DIR/.env" ]; then
+    scp -o StrictHostKeyChecking=no "$PROJECT_DIR/.env" "$TARGET:$REMOTE_DIR/"
+  else
+    info "No .env found locally — creating default on EC2 ..."
+    remote "cat > $REMOTE_DIR/.env" << 'ENV_EOF'
+HTTPS_PORT=8443
+BACKEND_PORT=3000
+# Set to the EC2 private IP so the bootstrap curl command works
+# HOST_IP=10.0.x.x
+ENV_EOF
+  fi
+
+  # Create packages directory (bind mount target)
+  remote "sudo mkdir -p $REMOTE_DIR/backend/packages && sudo chown -R \$(whoami):\$(whoami) $REMOTE_DIR"
+
+  # Auto-detect the server's public IP and write PLATFORM_PUBLIC_HOST into the
+  # remote .env so docker compose picks it up automatically — no manual editing
+  # required. Only writes/updates the value when it is currently unset; an
+  # existing non-empty value (e.g. a domain name) is always left untouched.
+  info "Auto-detecting server public IP for PLATFORM_PUBLIC_HOST ..."
+  remote "bash -s -- '$REMOTE_DIR'" << 'PUBIP_EOF'
+rd="$1"
+ip=""
+# IMDSv2 (preferred on instances with metadata token enforcement)
+token=$(curl -sf --connect-timeout 2 -X PUT \
+    "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 10" 2>/dev/null || true)
+if [ -n "$token" ]; then
+    ip=$(curl -sf --connect-timeout 2 \
+        -H "X-aws-ec2-metadata-token: $token" \
+        "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+fi
+# IMDSv1 fallback
+if [ -z "$ip" ]; then
+    ip=$(curl -sf --connect-timeout 2 \
+        "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+fi
+# hostname -I fallback (non-EC2 hosts)
+if [ -z "$ip" ]; then
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+fi
+envfile="$rd/.env"
+if [ -n "$ip" ]; then
+    existing=$(grep "^PLATFORM_PUBLIC_HOST=" "$envfile" 2>/dev/null | cut -d= -f2 | head -1 | tr -d '[:space:]')
+    if [ -z "$existing" ]; then
+        if grep -q "^PLATFORM_PUBLIC_HOST=" "$envfile" 2>/dev/null; then
+            sed -i "s|^PLATFORM_PUBLIC_HOST=.*|PLATFORM_PUBLIC_HOST=$ip|" "$envfile"
+        else
+            printf '\nPLATFORM_PUBLIC_HOST=%s\n' "$ip" >> "$envfile"
+        fi
+        echo "[ship.sh] PLATFORM_PUBLIC_HOST=$ip → $envfile"
+    else
+        echo "[ship.sh] PLATFORM_PUBLIC_HOST already set to '$existing' — leaving it unchanged"
+    fi
+else
+    echo "[ship.sh] Warning: could not detect public IP — PLATFORM_PUBLIC_HOST not set"
+fi
+PUBIP_EOF
+
+  # Transfer Ollama model archive if one was prepared (by --with-ai or --ai-models).
+  # This is a separate file from sabc-images.tar.gz — it contains raw model data
+  # that gets extracted into a Docker volume on the server, not loaded as an image.
+  if [ -f "$SCRIPT_DIR/ollama-models.tar.gz" ]; then
+    info "Transferring Ollama model archive ..."
+    scp -o StrictHostKeyChecking=no "$SCRIPT_DIR/ollama-models.tar.gz" "$TARGET:$REMOTE_DIR/"
+  fi
+
+  ok "Files transferred"
+}
+
+# ── Step 5: Snapshot current deployment for rollback ────────────────────────
+# Called before transferring new files so the previous compose, .env, and
+# built images are preserved.  A no-op when nothing is deployed yet.
+snapshot_for_rollback() {
+  info "Snapshotting current deployment for rollback ..."
+  ssh -o StrictHostKeyChecking=no "$TARGET" "sudo bash -s" << SNAP_EOF
+set -e
+rd="$REMOTE_DIR"
+snapped=0
+for img in sabc-compliance-backend:latest sabc-compliance-frontend:latest; do
+  name="\${img%%:*}"
+  if docker image inspect "\$img" >/dev/null 2>&1; then
+    docker tag "\$img" "\${name}:rollback"
+    echo "[snapshot] \$img → \${name}:rollback"
+    snapped=\$((snapped + 1))
+  fi
+done
+[ -f "\$rd/docker-compose.yml" ] && cp -f "\$rd/docker-compose.yml" "\$rd/docker-compose.yml.rollback"
+[ -f "\$rd/.env" ]               && cp -f "\$rd/.env"               "\$rd/.env.rollback"
+if [ "\$snapped" -gt 0 ]; then
+  echo "[snapshot] Rollback snapshot ready (\${snapped} image(s) tagged)."
+else
+  echo "[snapshot] No previous images found — rollback will not be available after this deploy."
+fi
+SNAP_EOF
+}
+
+# ── Rollback to previous snapshot ───────────────────────────────────────────
+# Restores :rollback images and the backed-up compose/.env, then restarts.
+# Also exposed as --rollback for manual use after a bad deploy.
+do_rollback() {
+  warn "Rolling back to previous deployment ..."
+  ssh -o StrictHostKeyChecking=no "$TARGET" "sudo bash -s" << ROLLBACK_EOF
+set -e
+rd="$REMOTE_DIR"
+
+# Detect compose binary (v1 standalone vs v2 plugin)
+if docker compose version >/dev/null 2>&1; then _bin="docker compose"; else _bin="docker-compose"; fi
+COMPOSE="\$_bin -f \$rd/docker-compose.yml --project-directory \$rd"
+
+# Stop the current (possibly broken) stack
+\$COMPOSE down --remove-orphans 2>/dev/null || true
+docker rm -f sabc-frontend sabc-backend sabc-postgres 2>/dev/null || true
+
+# Restore backed-up compose and env
+if [ -f "\$rd/docker-compose.yml.rollback" ]; then
+  cp -f "\$rd/docker-compose.yml.rollback" "\$rd/docker-compose.yml"
+  echo "[rollback] docker-compose.yml restored"
+else
+  echo "[rollback] WARNING: no docker-compose.yml.rollback — using current file"
+fi
+if [ -f "\$rd/.env.rollback" ]; then
+  cp -f "\$rd/.env.rollback" "\$rd/.env"
+  echo "[rollback] .env restored"
+fi
+
+# Promote :rollback images back to :latest
+rolled=0
+for name in sabc-compliance-backend sabc-compliance-frontend; do
+  if docker image inspect "\${name}:rollback" >/dev/null 2>&1; then
+    docker tag "\${name}:rollback" "\${name}:latest"
+    echo "[rollback] Restored \${name}:latest from :rollback"
+    rolled=\$((rolled + 1))
+  fi
+done
+
+if [ "\$rolled" -eq 0 ]; then
+  echo "[rollback] ERROR: no rollback images found — cannot restore previous version."
+  exit 1
+fi
+
+\$COMPOSE up -d --no-build
+echo "[rollback] Previous deployment successfully restored."
+ROLLBACK_EOF
+
+  ok "Rollback complete — previous version is running."
+}
+
+# ── Step 6: Load images and start ────────────────────────────────────────────
+deploy() {
+  info "Loading Docker images on $TARGET ..."
+  # sabc-images.tar.gz is a gzipped tarball of per-image docker-archive tars
+  # (backend.tar, frontend.tar, postgres.tar — see build_images). Extract it to a
+  # temp dir and load each one. "sudo bash -s" keeps every command elevated.
+  if ! remote "sudo bash -s -- '$REMOTE_DIR'" << 'LOAD_EOF'
+set -e
+rd="$1"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+tar -xzf "$rd/sabc-images.tar.gz" -C "$tmp"
+for f in "$tmp"/*.tar; do
+  echo "Loading $(basename "$f") ..."
+  docker load -i "$f"
+done
+LOAD_EOF
+  then
+    warn "Image load failed — initiating automatic rollback ..."
+    do_rollback || true
+    fail "Deployment failed during image load — automatically rolled back to previous version"
+  fi
+
+  info "Starting platform (PostgreSQL first, auto-migrating if needed) ..."
+  # Tear down any previous stack first. "down" only clears THIS compose
+  # project, so we also force-remove our own fixed-name containers (reliable
+  # because docker-compose.yml pins container_name) to free their published
+  # ports from a stale sabc-frontend/sabc-backend left by an earlier run.
+  # Only our named containers are touched — never any other app's container.
+  #
+  # Use "sudo bash -s" with a heredoc so sudo covers EVERY command:
+  # "sudo <compound>" only elevates up to the first semicolon; subsequent
+  # commands in the same string revert to the unprivileged user.
+  #
+  # The start sequence brings PostgreSQL up on its own, runs the one-shot
+  # SQLite → PostgreSQL migration BEFORE the backend boots (the backend seeds
+  # default users/groups into an empty DB on first start, which would make the
+  # idempotent migration skip those tables and strand the real SQLite data),
+  # then starts the full stack. A marker file makes the migration a no-op on
+  # every later deploy.  $REMOTE_DIR expands locally; \$ is evaluated remotely.
+  # Disable errexit so we can capture the exit code and trigger rollback instead
+  # of just aborting.  Re-enabled immediately after the heredoc.
+  set +e
+  ssh -o StrictHostKeyChecking=no "$TARGET" "sudo bash -s" << DEPLOY_EOF
+set -e
+if docker compose version >/dev/null 2>&1; then _bin="docker compose"; else _bin="docker-compose"; fi
+
+# If an Ollama model archive was transferred, extract it into the named volume
+# so the stock ollama/ollama container can serve it. Idempotent — re-running
+# overwrites with the same (or newer) model files.
+if [ -f "$REMOTE_DIR/ollama-models.tar.gz" ]; then
+  docker volume create sabc-ollama-models 2>/dev/null || true
+  # Skip extraction when the volume is already populated — avoids unpacking
+  # several GB on every deploy. Touch a stamp file matching the archive's mtime
+  # so a NEWER archive (model change) still re-extracts.
+  arch_stamp=\$(stat -c %Y "$REMOTE_DIR/ollama-models.tar.gz" 2>/dev/null || echo 0)
+  vol_stamp=\$(docker run --rm -v sabc-ollama-models:/m alpine \
+    sh -c 'cat /m/.sabc-archive-stamp 2>/dev/null || echo 0' 2>/dev/null || echo 0)
+  if docker run --rm -v sabc-ollama-models:/m alpine \
+       sh -c '[ -d /m/models/blobs ] && [ -n "\$(ls -A /m/models/blobs 2>/dev/null)" ]' 2>/dev/null \
+     && [ "\$arch_stamp" = "\$vol_stamp" ]; then
+    echo "[ship.sh] Ollama model already present in volume (stamp \$vol_stamp) — skipping extraction."
+  else
+    echo "[ship.sh] Extracting Ollama model files into Docker volume ..."
+    docker run --rm \
+      -v sabc-ollama-models:/root/.ollama \
+      -v "$REMOTE_DIR/ollama-models.tar.gz:/src/models.tar.gz" \
+      alpine sh -c "tar -xzf /src/models.tar.gz -C /root/.ollama && echo \$arch_stamp > /root/.ollama/.sabc-archive-stamp"
+    echo "[ship.sh] Ollama model files extracted."
+  fi
+fi
+
+COMPOSE="\$_bin -f $REMOTE_DIR/docker-compose.yml --project-directory $REMOTE_DIR"
+COMPOSE_FILE="$REMOTE_DIR/docker-compose.yml"
+
+# Guard: docker-compose v1 mis-handles image-only services when the file still
+# declares build: contexts -- it silently skips them and STILL exits 0, so the
+# deploy looks successful while only postgres actually starts. Abort early.
+if grep -qE "^[[:space:]]*build:" "\$COMPOSE_FILE"; then
+  echo "[ship.sh] FATAL: \$COMPOSE_FILE still contains build: directives."
+  echo "[ship.sh] This server runs docker-compose v1, which cannot start the"
+  echo "[ship.sh] pre-built image services from a file that has build: contexts."
+  echo "[ship.sh] Re-run with --update so the corrected docker-compose.yml is"
+  echo "[ship.sh] transferred to the server."
+  exit 2
+fi
+
+\$COMPOSE down --remove-orphans 2>/dev/null || true
+docker rm -f sabc-frontend sabc-backend sabc-postgres 2>/dev/null || true
+
+# 1) Bring the WHOLE stack up in one shot — the exact single "up -d" the proven
+#    manual deploy uses. Compose honours depends_on ordering (postgres →
+#    backend → frontend). We deliberately drop the old "compose run --rm"
+#    migration step: that ephemeral-container subcommand is the part that
+#    misbehaves on docker-compose v1 and forced the manual fallback.
+\$COMPOSE up -d
+
+# 2) Wait for PostgreSQL to report healthy so the migration below can connect.
+echo "[ship.sh] Waiting for PostgreSQL to become healthy ..."
+for i in \$(seq 1 30); do
+  s=\$(docker inspect -f '{{.State.Health.Status}}' sabc-postgres 2>/dev/null || echo starting)
+  [ "\$s" = "healthy" ] && break
+  sleep 2
+done
+
+# 3) One-shot SQLite → PostgreSQL migration, run as a follow-up against the
+#    already-running backend via "docker exec" — reliable on every compose
+#    version, unlike "compose run --rm". Marker-guarded so it runs at most once,
+#    and non-fatal so a hiccup never blocks the deploy. The migration script
+#    skips any table that already has rows, so it can never overwrite data.
+#    NOTE: because the backend boots (and seeds default groups/profiles/admin
+#    into an empty PostgreSQL) before this runs, a genuine SQLite→PostgreSQL
+#    *upgrade* would find those tables already populated and skip them. That
+#    matters only when importing a legacy SQLite database; fresh installs and
+#    already-migrated servers are unaffected.
+docker exec sabc-backend sh -c '
+  if [ -f /app/data/.migrated-to-postgres ]; then
+    echo "[ship.sh] Database already migrated to PostgreSQL — skipping."
+  elif [ -f /app/data/platform.db ]; then
+    echo "[ship.sh] Existing SQLite database found — migrating to PostgreSQL ..."
+    python /app/migrate_to_postgres.py && touch /app/data/.migrated-to-postgres
+  else
+    echo "[ship.sh] Fresh install (no SQLite database) — no migration needed."
+    touch /app/data/.migrated-to-postgres
+  fi
+' 2>&1 || echo "[ship.sh] Migration step skipped (non-fatal) — continuing."
+
+# 4) Wait 15 s — same window the working manual script uses — so containers
+#    that need a few seconds to transition from "created" to "running" are
+#    already stable before we inspect them.
+echo "=== Waiting 15s ==="
+sleep 15
+
+echo "=== Container status ==="
+docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+
+# 5) Verify the stack is REALLY up.  docker-compose v1 can return 0 without
+#    creating a service, so check real container state, not the exit code.
+missing=""
+for c in sabc-postgres sabc-backend sabc-frontend; do
+  st=\$(docker inspect -f '{{.State.Status}}' "\$c" 2>/dev/null || echo absent)
+  [ "\$st" = "running" ] || missing="\$missing \$c"
+done
+if [ -n "\$missing" ]; then
+  echo "[ship.sh] ERROR: these containers are not running:\$missing"
+  docker ps -a
+  for c in \$missing; do
+    echo "[ship.sh] ---------- last 40 log lines: \$c ----------"
+    docker logs --tail 40 "\$c" 2>&1 || echo "[ship.sh] (container \$c was never created)"
+  done
+  exit 1
+fi
+echo "[ship.sh] All containers running: postgres, backend, frontend."
+DEPLOY_EOF
+  _deploy_rc=$?
+  set -e
+
+  if [[ $_deploy_rc -ne 0 ]]; then
+    warn "Deploy sequence failed (exit $_deploy_rc) — initiating automatic rollback ..."
+    do_rollback || true
+    fail "Deployment failed — automatically rolled back to previous version"
+  fi
+
+  ok "Platform deployed!"
+
+  # Everything below is purely informational (URL banner). It must NEVER abort
+  # the script — under `set -euo pipefail` a no-match grep or a failed IP probe
+  # returns non-zero and would otherwise kill the run right before the URL is
+  # printed. Disable errexit for the remainder of the function (deploy() is the
+  # last thing the script does, so this never masks a later failure).
+  set +e
+
+  echo ""
+  echo "══════════════════════════════════════════════════════"
+  echo "  CRICLO Platform is running on:"
+  echo ""
+
+  # Detect the public IP of the EC2 instance.
+  # Modern EC2 instances require IMDSv2 (token-based); a plain IMDSv1 curl
+  # returns a 401 with an empty body which leaves pub_ip blank.
+  local pub_ip
+  pub_ip=$(remote 'bash -s' << 'IPEOF' 2>/dev/null
+set -e
+ip=""
+# 1) IMDSv2 — get a short-lived token, then request the public IPv4
+token=$(curl -sf --connect-timeout 2 -X PUT \
+  "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 10" 2>/dev/null || true)
+if [ -n "$token" ]; then
+  ip=$(curl -sf --connect-timeout 2 \
+    -H "X-aws-ec2-metadata-token: $token" \
+    "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+fi
+# 2) IMDSv1 fallback
+if [ -z "$ip" ]; then
+  ip=$(curl -sf --connect-timeout 2 \
+    "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+fi
+# 3) hostname fallback
+if [ -z "$ip" ]; then
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+printf "%s" "$ip"
+IPEOF
+  ) || pub_ip=""
+
+  # Strip stray whitespace/newlines from the captured output
+  pub_ip=$(printf "%s" "${pub_ip}" | tr -d '[:space:]')
+
+  # Final fallback: extract the host from the SSH target (user@host → host)
+  if [ -z "$pub_ip" ]; then
+    pub_ip="${TARGET#*@}"
+  fi
+
+  # Published HTTPS host port (defaults to 8443; read from local .env if set).
+  local https_port="8443"
+  if [ -f "$PROJECT_DIR/.env" ]; then
+    local p
+    p=$(grep -E '^HTTPS_PORT=' "$PROJECT_DIR/.env" | head -1 | cut -d= -f2 | tr -d '[:space:]' || true)
+    [ -n "$p" ] && https_port="$p"
+  fi
+
+  echo "  UI:      https://${pub_ip}:${https_port}"
+  echo "  API:     https://${pub_ip}:${https_port}/api"
+  echo "  Swagger: http://${pub_ip}:3000/docs"
+  echo ""
+  echo "  Status:  ssh $TARGET sudo docker ps"
+  echo "  Logs:    ssh $TARGET sudo docker logs -f sabc-backend   (or sabc-frontend)"
+  echo "  Stop:    ssh $TARGET 'cd $REMOTE_DIR && docker compose down'"
+  echo "  Note:    'docker-compose logs -f' may print a harmless KeyError: 'id' on v1;"
+  echo "           per-container 'docker logs' above avoids it."
+  echo "══════════════════════════════════════════════════════"
+  echo ""
+}
+
+# ── Partial service deploy ────────────────────────────────────────────────────
+# Loads the just-transferred image archive and restarts a single compose
+# service without touching postgres or any other running container.
+deploy_service() {
+  local svc="$1"   # compose service name: "backend" or "frontend"
+  local ctr="sabc-${svc}"
+
+  info "Loading ${svc} image on $TARGET ..."
+  if ! remote "sudo bash -s -- '$REMOTE_DIR'" << 'LOAD_SVC_EOF'
+set -e
+rd="$1"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+tar -xzf "$rd/sabc-images.tar.gz" -C "$tmp"
+for f in "$tmp"/*.tar; do
+  echo "Loading $(basename "$f") ..."
+  docker load -i "$f"
+done
+LOAD_SVC_EOF
+  then
+    fail "${svc} image load failed"
+  fi
+
+  info "Restarting ${svc} container (keeping all other services running) ..."
+  set +e
+  ssh -o StrictHostKeyChecking=no "$TARGET" "sudo bash -s" << RESTART_SVC_EOF
+set -e
+if docker compose version >/dev/null 2>&1; then _bin="docker compose"; else _bin="docker-compose"; fi
+COMPOSE="\$_bin -f $REMOTE_DIR/docker-compose.yml --project-directory $REMOTE_DIR"
+\$COMPOSE up -d --no-deps $svc
+sleep 8
+st=\$(docker inspect -f '{{.State.Status}}' $ctr 2>/dev/null || echo absent)
+if [ "\$st" != "running" ]; then
+  echo "[ship.sh] ERROR: $ctr is not running (status: \$st)"
+  docker logs --tail 40 $ctr 2>&1 || true
+  exit 1
+fi
+echo "[ship.sh] $ctr is running."
+RESTART_SVC_EOF
+  _svc_rc=$?
+  set -e
+  if [[ $_svc_rc -ne 0 ]]; then
+    fail "${svc} deployment failed — check logs above"
+  fi
+  ok "${svc} updated and running!"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+# ── Partial deploy: --backend-only / --frontend-only ─────────────────────────
+if [[ "$BACKEND_ONLY" == true || "$FRONTEND_ONLY" == true ]]; then
+  svc=$( [[ "$BACKEND_ONLY" == true ]] && echo backend || echo frontend )
+
+  if [[ "$DO_ROLLBACK" == true ]]; then
+    do_rollback
+    exit 0
+  fi
+
+  if [[ "$DEPLOY_ONLY" == true ]]; then
+    if ! remote "test -f $REMOTE_DIR/sabc-images.tar.gz && test -f $REMOTE_DIR/docker-compose.yml"; then
+      fail "Remote files missing in $REMOTE_DIR — run without --deploy-only first to transfer them"
+    fi
+    deploy_service "$svc"
+    exit 0
+  fi
+
+  if [[ "$DO_UPDATE" == true ]]; then
+    [ ! -f "$ARCHIVE" ] && fail "No archive at $ARCHIVE — run without --update first to build"
+    transfer
+    deploy_service "$svc"
+    exit 0
+  fi
+
+  if [[ "$DO_SETUP" == true ]]; then setup_ec2; fi
+  build_images
+  save_images
+  transfer
+  deploy_service "$svc"
+  exit 0
+fi
+
+if [[ "$BUILD_ONLY" == true || "$BUNDLE" == true ]]; then
+  build_images
+  save_images
+  echo ""
+  info "Archive at: $ARCHIVE"
+  info "Transfer manually:  scp $ARCHIVE user@ec2-ip:$REMOTE_DIR/"
+  exit 0
+fi
+
+if [[ "$DO_ROLLBACK" == true ]]; then
+  do_rollback
+  exit 0
+fi
+
+if [[ "$DEPLOY_ONLY" == true ]]; then
+  # Files already on the remote — skip build AND transfer, just load + restart.
+  # Verify the archive and compose file are actually present remotely first so
+  # we fail with a clear message instead of a confusing docker error.
+  if ! remote "test -f $REMOTE_DIR/sabc-images.tar.gz && test -f $REMOTE_DIR/docker-compose.yml"; then
+    fail "Remote files missing in $REMOTE_DIR (need sabc-images.tar.gz + docker-compose.yml) — run --update first to transfer them"
+  fi
+  snapshot_for_rollback
+  deploy
+  exit 0
+fi
+
+if [[ "$DO_UPDATE" == true ]]; then
+  # Skip build — just transfer existing archive and restart
+  if [ ! -f "$ARCHIVE" ]; then
+    fail "No archive found at $ARCHIVE — run without --update first, or run --build-only"
+  fi
+  snapshot_for_rollback
+  transfer
+  deploy
+  exit 0
+fi
+
+# Full deploy
+if [[ "$DO_SETUP" == true ]]; then
+  setup_ec2
+fi
+
+build_images
+save_images
+snapshot_for_rollback
+transfer
+deploy

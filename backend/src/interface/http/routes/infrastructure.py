@@ -1,0 +1,423 @@
+from __future__ import annotations
+import glob
+import os
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+
+from core.domain.entities import AuthPrincipal
+from core.errors import NotFoundError, ValidationError
+from interface.http.routes.auth import get_current_principal, require_operator
+
+router = APIRouter(prefix="/infrastructure", tags=["Infrastructure"])
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
+
+class ServiceStatus(BaseModel):
+    configured: bool
+    host: str | None = None
+    port: int
+    reachable: bool | None = None
+
+
+class InfrastructureStatusResponse(BaseModel):
+    puppet: ServiceStatus
+
+
+class SetHostRequest(BaseModel):
+    host: str
+
+
+class SetPuppetCredentialsRequest(BaseModel):
+    admin_user: str = "admin"
+    admin_password: str
+
+
+class SetPuppetEditionRequest(BaseModel):
+    # "enterprise" (PE Advanced, RBAC + Node Classifier APIs) or
+    # "core" (open-source Puppet, classification via ENC over SSH).
+    edition: str
+
+
+class SwitchPuppetEditionRequest(BaseModel):
+    edition: str        # "enterprise" | "core"
+    node_id: str        # the master node to (re)install with this edition
+
+
+class InstallRequest(BaseModel):
+    node_id: str
+
+
+class JobRef(BaseModel):
+    id: str
+    type: str
+    status: str
+    node_id: str | None = None
+
+
+# ── Dependency injection ──────────────────────────────────────────────────────
+
+_get_status_uc = None
+_set_master_uc = None
+_install_puppet_master_uc = None
+_install_puppet_agent_uc = None
+_install_detection_agent_uc = None
+_check_health_uc = None
+_scan_engine_uc = None
+_node_repo = None
+_packages_dir: str = ""
+_ssh_client = None
+_config_repo = None
+_configure_puppet_core_enc_uc = None
+_switch_puppet_edition_uc = None
+_deploy_compliance_module_uc = None
+
+
+def set_use_cases(
+    get_status_uc,
+    set_master_uc,
+    install_puppet_master_uc,
+    install_puppet_agent_uc,
+    install_detection_agent_uc=None,
+    check_health_uc=None,
+    scan_engine_uc=None,
+    node_repo=None,
+    packages_dir: str = "",
+    ssh_client=None,
+    config_repo=None,
+    configure_puppet_core_enc_uc=None,
+    switch_puppet_edition_uc=None,
+    deploy_compliance_module_uc=None,
+) -> None:
+    global _get_status_uc, _set_master_uc
+    global _install_puppet_master_uc
+    global _install_puppet_agent_uc, _install_detection_agent_uc
+    global _check_health_uc, _scan_engine_uc
+    global _node_repo, _packages_dir, _ssh_client, _config_repo
+    global _configure_puppet_core_enc_uc, _switch_puppet_edition_uc
+    global _deploy_compliance_module_uc
+    _get_status_uc = get_status_uc
+    _set_master_uc = set_master_uc
+    _install_puppet_master_uc = install_puppet_master_uc
+    _install_puppet_agent_uc = install_puppet_agent_uc
+    _install_detection_agent_uc = install_detection_agent_uc
+    _check_health_uc = check_health_uc
+    _scan_engine_uc = scan_engine_uc
+    _node_repo = node_repo
+    _packages_dir = packages_dir
+    _ssh_client = ssh_client
+    _config_repo = config_repo
+    _configure_puppet_core_enc_uc = configure_puppet_core_enc_uc
+    _switch_puppet_edition_uc = switch_puppet_edition_uc
+    _deploy_compliance_module_uc = deploy_compliance_module_uc
+
+
+def _puppet_agent_platform(os_family: str | None, os_name: str | None, os_version: str | None) -> str:
+    """Build the PE platform string from node OS facts."""
+    if os_family == "Debian":
+        name = (os_name or "").lower()
+        version = os_version or ""
+        return f"{name}-{version}-amd64"
+    else:
+        major = (os_version or "").split(".")[0]
+        return f"el-{major}-x86_64"
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+class PlatformCheckResponse(BaseModel):
+    platform: str
+    has_tarball: bool
+    tarball_name: str
+    packages_dir: str
+
+
+@router.get("/puppet-agent/platform-check", response_model=PlatformCheckResponse, summary="Check platform package availability")
+async def puppet_agent_platform_check(
+    node_id: str = Query(...),
+    principal: AuthPrincipal = Depends(get_current_principal),
+):
+    """Check whether a platform tarball is available for the node's OS."""
+    if _node_repo is None:
+        raise HTTPException(status_code=503, detail="Node repository not available")
+    try:
+        node = await _node_repo.get(node_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    platform = _puppet_agent_platform(node.os_family, node.os_name, node.os_version)
+    tarball_name = f"puppet-agent-{platform}.tar.gz"
+    agent_pkg_dir = os.path.join(_packages_dir, "puppet-agent")
+    pattern = os.path.join(agent_pkg_dir, tarball_name)
+    has_tarball = bool(glob.glob(pattern))
+
+    return PlatformCheckResponse(
+        platform=platform,
+        has_tarball=has_tarball,
+        tarball_name=tarball_name,
+        packages_dir=agent_pkg_dir,
+    )
+
+
+@router.get("/status", response_model=InfrastructureStatusResponse, summary="Get infrastructure status")
+async def get_status(principal: AuthPrincipal = Depends(get_current_principal)):
+    """Returns connectivity status for the Puppet master."""
+    result = await _get_status_uc.execute()
+    return InfrastructureStatusResponse(
+        puppet=ServiceStatus(**result["puppet"]),
+    )
+
+
+@router.post("/puppet-master", summary="Connect to an existing Puppet master")
+async def set_puppet_master(
+    body: SetHostRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """Save a Puppet master hostname and test connectivity."""
+    try:
+        return await _set_master_uc.execute("puppet", body.host)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.post("/puppet-credentials", summary="Set Puppet Enterprise RBAC credentials")
+async def set_puppet_credentials(
+    body: SetPuppetCredentialsRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """Store the PE console admin username and password used by SABC to
+    authenticate against the RBAC API for node-group classification.
+
+    Call this whenever the PE console admin password changes — the stored
+    credentials are used by every subsequent node-group sync.
+    """
+    if not _config_repo:
+        raise HTTPException(status_code=503, detail="Config repository not available")
+    password = body.admin_password.strip()
+    if not password:
+        raise HTTPException(status_code=422, detail="admin_password is required")
+    await _config_repo.set("pe_console_password", password)
+    await _config_repo.set("pe_admin_user", body.admin_user.strip() or "admin")
+    return {"message": "Puppet Enterprise credentials updated", "admin_user": body.admin_user}
+
+
+@router.get("/puppet-edition", summary="Get the active Puppet edition (enterprise | core)")
+async def get_puppet_edition(
+    principal: AuthPrincipal = Depends(get_current_principal),
+):
+    """Report which Puppet edition node-group sync targets.
+
+    ``enterprise`` uses the PE-only RBAC + Node Classifier APIs; ``core`` uses
+    an External Node Classifier deployed over SSH (no commercial APIs)."""
+    from config import get_settings
+    edition = None
+    if _config_repo:
+        try:
+            edition = await _config_repo.get("puppet_edition")
+        except Exception:
+            edition = None
+    edition = (edition or get_settings().puppet_edition or "enterprise").strip().lower()
+    return {"edition": edition}
+
+
+@router.post("/puppet-edition", summary="Switch the Puppet edition (enterprise | core)")
+async def set_puppet_edition(
+    body: SetPuppetEditionRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """Switch between Puppet Enterprise and Puppet Core. This only changes which
+    classification backend the next node-group sync uses — it does not touch the
+    master. For Puppet Core, run POST /configure/puppet-core-enc once afterwards
+    to enable the ENC on the master."""
+    if not _config_repo:
+        raise HTTPException(status_code=503, detail="Config repository not available")
+    edition = (body.edition or "").strip().lower()
+    if edition not in ("enterprise", "core"):
+        raise HTTPException(status_code=422, detail="edition must be 'enterprise' or 'core'")
+    await _config_repo.set("puppet_edition", edition)
+    return {"message": f"Puppet edition set to '{edition}'", "edition": edition}
+
+
+@router.post("/puppet-edition/switch", response_model=JobRef, status_code=202,
+             summary="Switch the master between Puppet Enterprise and Puppet Core")
+async def switch_puppet_edition(
+    body: SwitchPuppetEditionRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """One-button edition switch: records the new edition, (re)installs the
+    master with it (purging the opposite edition — PE and Core cannot coexist),
+    and for Core auto-configures the ENC once puppetserver is up.
+
+    Enterprise requires a PE installer tarball under packages/puppet-master/;
+    Core installs from the bundled packages or the public Puppet repo. Switching
+    regenerates the master CA, so agents must re-enroll afterwards."""
+    if _switch_puppet_edition_uc is None:
+        raise HTTPException(status_code=503, detail="Edition switching not available")
+    try:
+        job = await _switch_puppet_edition_uc.execute(body.node_id, body.edition)
+        return JobRef(id=job.id, type=job.type, status=job.status, node_id=job.node_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.post("/configure/puppet-core-enc", response_model=JobRef, status_code=202,
+             summary="Enable the External Node Classifier on a Puppet Core master (one-time)")
+async def configure_puppet_core_enc(
+    body: InstallRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """Run the one-time Ansible job that points the Puppet Core master at the
+    SABC ENC (node_terminus = exec + external_nodes) and restarts puppetserver.
+    Per-node classification data is pushed automatically on every sync."""
+    if _configure_puppet_core_enc_uc is None:
+        raise HTTPException(status_code=503, detail="Puppet Core ENC configuration not available")
+    try:
+        job = await _configure_puppet_core_enc_uc.execute(body.node_id)
+        return JobRef(id=job.id, type=job.type, status=job.status, node_id=job.node_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/deploy/compliance-module", response_model=JobRef, status_code=202,
+             summary="Deploy the sabc_compliance Puppet module and enforce the referential")
+async def deploy_compliance_module(
+    body: InstallRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """Copy the sabc_compliance module to the Puppet master (``node_id`` = the
+    master) and add a site-manifest include so every managed node enforces the
+    internal referential when it runs `puppet agent -t` — the enforcement half
+    of the closed remediation loop."""
+    if _deploy_compliance_module_uc is None:
+        raise HTTPException(status_code=503, detail="Compliance module deployment not available")
+    try:
+        job = await _deploy_compliance_module_uc.execute(body.node_id)
+        return JobRef(id=job.id, type=job.type, status=job.status, node_id=job.node_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/install/puppet-master", response_model=JobRef, status_code=202, summary="Install Puppet master on a node")
+async def install_puppet_master(
+    body: InstallRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """Start an Ansible job to install Puppet master on the specified node."""
+    try:
+        job = await _install_puppet_master_uc.execute(body.node_id)
+        return JobRef(id=job.id, type=job.type, status=job.status, node_id=job.node_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/install/puppet-agent", response_model=JobRef, status_code=202, summary="Install Puppet agent on a node")
+async def install_puppet_agent(
+    body: InstallRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """Start an Ansible job to install and enroll the Puppet agent on the specified node."""
+    try:
+        job = await _install_puppet_agent_uc.execute(body.node_id)
+        return JobRef(id=job.id, type=job.type, status=job.status, node_id=job.node_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/install/detection-agent", response_model=JobRef, status_code=202, summary="Install the compliance detection agent on a node")
+async def install_detection_agent(
+    body: InstallRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """Start an Ansible job that installs the custom lightweight detection agent
+    (file-integrity watch on the compliance-critical paths) and points it at
+    this platform's detection webhook."""
+    if _install_detection_agent_uc is None:
+        raise HTTPException(status_code=503, detail="Detection agent install use case not configured")
+    try:
+        job = await _install_detection_agent_uc.execute(body.node_id)
+        return JobRef(id=job.id, type=job.type, status=job.status, node_id=job.node_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.post("/check-health", response_model=JobRef, status_code=202, summary="Run a read-only node health check")
+async def check_node_health(
+    body: InstallRequest,
+    principal: AuthPrincipal = Depends(require_operator),
+):
+    """Start a read-only Ansible diagnostic job that reports Puppet/detection-agent/network state."""
+    if _check_health_uc is None:
+        raise HTTPException(status_code=503, detail="Health check use case not configured")
+    try:
+        job = await _check_health_uc.execute(body.node_id)
+        return JobRef(id=job.id, type=job.type, status=job.status, node_id=job.node_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ── Scan engine (platform controller) ─────────────────────────────────────────
+# The scan engine (CINC Auditor) is agentless: it lives on the SABC platform
+# and reaches each node over SSH. These endpoints expose the controller-side
+# install state and let the operator verify that the platform can probe each node.
+
+class ScanEngineStatusResponse(BaseModel):
+    installed: bool
+    version: str | None = None
+    executable_path: str
+
+
+class ScanEngineVerifyResult(BaseModel):
+    node_id: str | None = None
+    hostname: str | None = None
+    reachable: bool
+    output: str | None = None
+    error: str | None = None
+
+
+class ScanEngineVerifyAllResponse(BaseModel):
+    controller: ScanEngineStatusResponse
+    total: int = 0
+    reachable: int = 0
+    results: list[ScanEngineVerifyResult] = []
+    error: str | None = None
+
+
+@router.get("/scan-engine/status", response_model=ScanEngineStatusResponse, summary="Scan engine platform install status")
+async def get_scan_engine_status(principal: AuthPrincipal = Depends(get_current_principal)):
+    """Return whether the scan engine (CINC Auditor) is installed on the SABC platform server."""
+    if _scan_engine_uc is None:
+        raise HTTPException(status_code=503, detail="Scan engine use case not configured")
+    return ScanEngineStatusResponse(**(await _scan_engine_uc.get_status()))
+
+
+@router.post("/scan-engine/install", summary="Install the scan engine on the platform server")
+async def install_scan_engine_on_controller(principal: AuthPrincipal = Depends(require_operator)):
+    """Run the CINC Auditor installer inside the platform container."""
+    if _scan_engine_uc is None:
+        raise HTTPException(status_code=503, detail="Scan engine use case not configured")
+    result = await _scan_engine_uc.install_on_controller()
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result)
+    return result
+
+
+@router.post("/scan-engine/verify", response_model=ScanEngineVerifyAllResponse, summary="Verify scan engine can reach every node")
+async def verify_scan_engine_all(principal: AuthPrincipal = Depends(require_operator)):
+    """Probe every node over SSH and mark nodes scan_ready when reachable."""
+    if _scan_engine_uc is None:
+        raise HTTPException(status_code=503, detail="Scan engine use case not configured")
+    return await _scan_engine_uc.verify_all_nodes()
+
+
+@router.post("/scan-engine/verify/{node_id}", response_model=ScanEngineVerifyResult, summary="Verify scan engine can reach a single node")
+async def verify_scan_engine_node(node_id: str, principal: AuthPrincipal = Depends(require_operator)):
+    """Probe one node and update its scan_ready flag."""
+    if _scan_engine_uc is None:
+        raise HTTPException(status_code=503, detail="Scan engine use case not configured")
+    try:
+        return await _scan_engine_uc.verify_node(node_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
