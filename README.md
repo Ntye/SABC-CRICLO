@@ -29,39 +29,36 @@ host is Docker — nothing else is installed on your machine.
 ## 1. Architecture
 
 ```
-Browser
+Browser (Windows / Linux)
   │
-  └─▶ :80  frontend container (Nginx)
-            ├── /           React SPA (static files)
-            ├── /api/       → http://sabc-backend:3000/   (REST API, 900s timeout)
-            └── /api/*/ws   → ws://sabc-backend:3000/*    (live job log streaming)
+  └─▶ Ubuntu Server (port 80/8443)
+            ├── Nginx (frontend proxy)
+            │   ├── / React SPA (static files)
+            │   ├── /api/ → backend:3000 (REST API)
+            │   └── /api/*/ws → backend:3000 (WebSocket streams)
+            └── Docker containers (sabc-backend, sabc-frontend, sabc-postgres)
+                ├── sabc-backend (FastAPI + Ansible runner)
+                │   Volumes:
+                │   ├── sabc-backend-data → /app/data (PostgreSQL)
+                │   ├── sabc-backend-keys → /app/keys (SSH key pair)
+                │   └── /app/packages (airgap install files)
+                ├── sabc-frontend (Nginx + React)
+                └── sabc-postgres (PostgreSQL database)
 
-sabc-backend container (FastAPI + Ansible + OpenSSH client)
-  Volumes:
-    sabc_backend-data  →  /app/data            SQLite database (nodes, jobs, rules, audit)
-    sabc_backend-keys  →  /app/keys            Ansible SSH key pair (generated once, persisted)
-    ./backend/packages →  /app/packages        Airgap install files (.deb/.rpm/wheels)
-    ./detection-agent  →  /app/detection-agent Agent sources shipped to managed nodes
+Managed Nodes (SSH-based, no agent required for basic ops)
+  ├── Puppet agent (if enabled for enforcement)
+  └── Detection agent (optional, for live drift detection + evidence capture)
 
-Docker network: sabc-net (bridge, internal — backend is not exposed to LAN)
-
-Managed node (each server in the fleet)
-  ├── puppet-agent                 enforcement plane — applies the referential
-  └── compliance-detection-agent  detection plane — SABC's own lightweight
-        Python daemon (inotify via watchdog). Watches /etc/ssh/, /etc/pam.d/,
-        /etc/sudoers*, /etc/passwd, /etc/group, /etc/shadow, snapshots every
-        change as evidence (SHA-256 + metadata, content where policy allows)
-        and POSTs it to the platform:
-
-          POST /api/webhooks/detection   (X-API-Key + optional CIDR allowlist)
 ```
+The browser communicates with the platform through a single HTTPS origin on
+port 8443. Nginx terminates TLS and serves the React SPA. It reverse-proxies
+REST API requests under `/api/` and WebSocket connections under `/api/*/ws`
+to the FastAPI backend on port 3000 over the private Docker network.
 
-The browser talks to a **single origin** (port 80). Nginx proxies all `/api/` traffic and
-WebSocket connections to the backend over the private Docker network. No CORS issues,
-no hard-coded backend hostname in the browser.
+The backend's port 3000 is not used by the browser for normal application
+traffic. It is the internal API service port and may optionally be published
+on the host for direct API/Swagger access when explicitly required.
 
-The backend exposes port 3000 separately for direct API access and the Swagger docs
-(`http://localhost:3000/docs`).
 
 ### Detection → scan (→ optional remediation) loop
 
@@ -118,8 +115,8 @@ Re-login after adding yourself to the `docker` group.
 
 ```bash
 # 1. Clone the repository
-git clone <repo-url> SABC-Compliance
-cd SABC-Compliance
+git clone https://github.com/Ntye/SABC-CRICLO
+cd SABC-CRICLO
 
 # 2. Create your environment file
 cp backend/.env.example .env
@@ -146,8 +143,8 @@ ssh-rsa AAAA... sabc-ansible    ← the platform's public SSH key
 ============================================================
   SABC Compliance Platform  v1.0.0
   Société Anonyme des Brasseries du Cameroun
-  API:   http://0.0.0.0:3000
-  Docs:  http://localhost:3000/docs
+  API:   https://0.0.0.0:3000
+  Docs:  https://localhost:3000/docs
 ============================================================
 ```
 
@@ -159,9 +156,9 @@ all managed servers.
 
 | URL | Purpose |
 |-----|---------|
-| `http://localhost` | Main platform UI |
-| `http://localhost:3000/docs` | Swagger / OpenAPI docs |
-| `http://localhost:3000/redoc` | ReDoc API reference |
+| `https://localhost:8443` | Main platform UI |
+| `https://localhost:3000/docs` | Swagger / OpenAPI docs |
+| `https://localhost:3000/redoc` | ReDoc API reference |
 
 ### Dev mode (live code reloading)
 
@@ -195,7 +192,7 @@ docker compose -f docker-compose.dev.yml up --build -d
 
 ### Login
 
-Log in at `http://localhost` with the admin credentials printed on first run. On every
+Log in at `https://localhost:8443` with the admin credentials printed on first run. On every
 login the server issues a **JWT session token** and a **personal API key** (matching your
 role), both stored automatically in the browser.
 
@@ -223,7 +220,7 @@ For scripts or CI pipelines, create a named API key from the **API Keys** page a
 as a header:
 
 ```bash
-curl -H "X-API-Key: sabc_<key>" http://localhost:3000/nodes
+curl -H "X-API-Key: sabc_<key>" https://localhost:3000/nodes
 ```
 
 ---
@@ -240,7 +237,7 @@ passwordless sudo. No manual SSH key copying needed.
 Open the **Add Server** page. Copy the one-liner and run it on the target server as root:
 
 ```bash
-curl -sSL http://<platform-ip>/api/nodes/bootstrap | sudo bash
+curl -sSLk https://<platform-ip>:8443/api/nodes/bootstrap | sudo bash
 ```
 
 The script is served unauthenticated (it only contains the public key, which is not secret).
@@ -490,7 +487,7 @@ docker compose up -d
 All authenticated API calls are logged. View under **Audit** in the UI, or query directly:
 
 ```bash
-curl -H "X-API-Key: sabc_<key>" http://localhost:3000/audit?limit=50
+curl -H "X-API-Key: sabc_<key>" https://localhost:3000/audit?limit=50
 ```
 
 ---
@@ -557,7 +554,7 @@ The bootstrap one-liner uses the platform's **private IP** (reachable within the
 
 ```bash
 # On the target EC2 (in the same VPC):
-curl -sSL http://<platform-private-ip>/api/nodes/bootstrap | sudo bash
+curl -sSL SABC-CRICLO://<platform-private-ip>/api/nodes/bootstrap | sudo bash
 ```
 
 For EC2s in a **different AWS account**, open TCP 22 inbound on their security group to
@@ -566,7 +563,7 @@ the platform EC2's public IP, then use the public IP in the bootstrap command.
 ### Recommended .env on EC2
 
 ```bash
-HTTP_PORT=80
+HTTPS_PORT=8443
 BACKEND_PORT=3000
 JWT_SECRET=<random 32+ chars>
 # Set to the EC2 private IP so the bootstrap curl command auto-populates in the UI:
@@ -629,13 +626,13 @@ For local use (everything on the same Mac), no special flags are needed.
 
 ---
 
-## 12. Configuration reference (`.env`)
+## 12. Configuration reference
 
 Copy `backend/.env.example` to `.env` in the project root before starting.
 
 | Variable | Default | Required | Purpose |
 |----------|---------|----------|---------|
-| `HTTP_PORT` | `80` | — | Host port for the UI |
+| `HTTPS_PORT` | `8443` | — | Host port for the UI |
 | `BACKEND_PORT` | `3000` | — | Host port for the API + Swagger |
 | `JWT_SECRET` | — | **Yes** | Session token signing key (32+ random chars) |
 | `JWT_EXPIRE_HOURS` | `24` | — | How long a login session lasts |
@@ -670,7 +667,7 @@ These volumes survive `docker compose down` and `docker compose up --build`. Onl
 ## Project structure
 
 ```
-SABC-Compliance/
+SABC-CRICLO/
 ├── backend/
 │   ├── src/
 │   │   ├── core/          Domain entities, interfaces, errors, events
