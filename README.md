@@ -576,23 +576,22 @@ HOST_IP=10.0.x.x
 
 For environments with no internet access, bundle the offline installers into the backend image:
 
+- Place offline installers into `backend/packages/` (see `backend/packages/README.md`)
+- Build the bundled image (bakes `packages/` into the image):
 ```bash
-# 1. Place offline installers into backend/packages/ (see backend/packages/README.md)
+# From a Linux machine:
+./deploy/ship.sh --build-only
 
-# 2. Build the bundled image (bakes packages/ into the image):
-./deploy/ship.sh --bundle
-# or manually:
-docker compose build
-docker build -f backend/Dockerfile.bundle -t sabc-compliance-backend:bundled ./backend
+# From a Windows machine:
+.\deploy\ship.ps1 -BuildOnly
+```
+- Transfer and start deployment on the airgap server:
+```bash
+# From a Linux machine:
+./deploy/ship.sh <user>@<ip-addr> --update
 
-# 3. Transfer to the airgap machine:
-docker save sabc-compliance-backend:bundled sabc-compliance-frontend \
-  | gzip > sabc-bundle.tar.gz
-# SCP / USB transfer sabc-bundle.tar.gz to the target machine
-
-# 4. On the airgap machine:
-docker load -i sabc-bundle.tar.gz
-docker compose up -d
+# From a Windows machine:
+.\deploy\ship.ps1 -Target <user>@<ip-addr> -Update
 ```
 
 On first start, the entrypoint seeds `/app/packages/` from the bundled files inside the
