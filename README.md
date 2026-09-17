@@ -489,7 +489,7 @@ an EC2 instance via SCP, loads them, and starts the platform. No Docker Hub, no 
 # Launch an EC2 (Ubuntu 22.04, t3.small+)
 # Security group inbound rules:
 #   TCP 22   from your IP       (SSH to platform)
-#   TCP 80   from 0.0.0.0/0    (Platform UI)
+#   TCP 8443   from 0.0.0.0/0    (Platform UI)
 
 # From your local machine (where the source code is):
 chmod +x deploy/ship.sh
