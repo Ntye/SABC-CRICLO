@@ -4,27 +4,27 @@
 # =============================================================================
 #
 # Usage:
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -SshKey .\keys\id_rsa
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -Setup        # First time: installs Docker
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -Update       # Skip rebuild: transfer existing archive + load + start
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -Start        # Skip build/transfer: load already-transferred archive + start
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -Restart      # Skip build/transfer/load: just docker compose up -d
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -Rollback     # Roll back to the previous deployment
+#   .\deploy\ship.ps1 -Target user@ip-addr
+#   .\deploy\ship.ps1 -Target user@ip-addr -SshKey .\keys\id_rsa
+#   .\deploy\ship.ps1 -Target user@ip-addr -Setup        # First time: installs Docker
+#   .\deploy\ship.ps1 -Target user@ip-addr -Update       # Skip rebuild: transfer existing archive + load + start
+#   .\deploy\ship.ps1 -Target user@ip-addr -Start        # Skip build/transfer: load already-transferred archive + start
+#   .\deploy\ship.ps1 -Target user@ip-addr -Restart      # Skip build/transfer/load: just docker compose up -d
+#   .\deploy\ship.ps1 -Target user@ip-addr -Rollback     # Roll back to the previous deployment
 #   .\deploy\ship.ps1 -BuildOnly                                 # Build and save locally only
 #
 # Partial service updates (faster — only rebuilds and restarts one container):
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -BackendOnly          Rebuild and redeploy only the backend
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -FrontendOnly         Rebuild and redeploy only the frontend
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -Update -BackendOnly  Transfer existing archive, restart backend
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -Update -FrontendOnly Transfer existing archive, restart frontend
+#   .\deploy\ship.ps1 -Target user@ip-addr -BackendOnly          Rebuild and redeploy only the backend
+#   .\deploy\ship.ps1 -Target user@ip-addr -FrontendOnly         Rebuild and redeploy only the frontend
+#   .\deploy\ship.ps1 -Target user@ip-addr -Update -BackendOnly  Transfer existing archive, restart backend
+#   .\deploy\ship.ps1 -Target user@ip-addr -Update -FrontendOnly Transfer existing archive, restart frontend
 #
 # Offline AI assistant (Ollama):
 #   Add -WithAI to bake the LLM model into the archive. The model is downloaded
 #   ONCE on this (internet-connected) build machine; the server needs no internet.
 #
-#   .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -WithAI
-#   $env:OLLAMA_MODEL="llama3.2:3b"; .\deploy\ship.ps1 -Target ubuntu@192.168.1.50 -WithAI
+#   .\deploy\ship.ps1 -Target user@ip-addr -WithAI
+#   $env:OLLAMA_MODEL="llama3.2:3b"; .\deploy\ship.ps1 -Target user@ip-addr -WithAI
 #
 #   Without -WithAI the assistant is not built/shipped; the chat widget shows
 #   "offline" and everything else works normally.
