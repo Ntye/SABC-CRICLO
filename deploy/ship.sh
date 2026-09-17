@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# SABC Compliance Platform — EC2 Deployment Script
+# SABC Compliance Platform — Server Deployment Script
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Usage:
-#   ./deploy/ship.sh user@ec2-ip                Build, transfer, and deploy
-#   ./deploy/ship.sh user@ec2-ip --setup        First time: install Docker + deploy
-#   ./deploy/ship.sh user@ec2-ip --update       Transfer and restart (skip build)
-#   ./deploy/ship.sh user@ec2-ip --deploy-only  Load + restart only (skip build & transfer)
-#   ./deploy/ship.sh user@ec2-ip --rollback     Roll back to the previous deployment
+#   ./deploy/ship.sh user@ip-addr                Build, transfer, and deploy
+#   ./deploy/ship.sh user@ip-addr --setup        First time: install Docker + deploy
+#   ./deploy/ship.sh user@ip-addr --update       Transfer and restart (skip build)
+#   ./deploy/ship.sh user@ip-addr --deploy-only  Load + restart only (skip build & transfer)
+#   ./deploy/ship.sh user@ip-addr --rollback     Roll back to the previous deployment
 #   ./deploy/ship.sh --build-only               Build and save images locally
 #   ./deploy/ship.sh --bundle                   Build bundled image (with airgap packages)
 #
 # Partial service updates (faster — only rebuilds and restarts one container):
-#   ./deploy/ship.sh user@ec2-ip --backend-only          Rebuild and redeploy only the backend
-#   ./deploy/ship.sh user@ec2-ip --frontend-only         Rebuild and redeploy only the frontend
-#   ./deploy/ship.sh user@ec2-ip --update --backend-only Transfer existing archive, restart backend
-#   ./deploy/ship.sh user@ec2-ip --update --frontend-only Transfer existing archive, restart frontend
+#   ./deploy/ship.sh user@ip-addr --backend-only          Rebuild and redeploy only the backend
+#   ./deploy/ship.sh user@ip-addr --frontend-only         Rebuild and redeploy only the frontend
+#   ./deploy/ship.sh user@ip-addr --update --backend-only Transfer existing archive, restart backend
+#   ./deploy/ship.sh user@ip-addr --update --frontend-only Transfer existing archive, restart frontend
 #
 # Offline AI assistant (Ollama):
 #   Opt in with --with-ai to bake the LLM model into the archive. The model is
 #   downloaded ONCE on this (internet-connected) build machine and committed into
 #   an image layer — the server needs no internet at all.
 #
-#   ./deploy/ship.sh user@ec2-ip --with-ai                 embed the default model (llama3.2:3b)
+#   ./deploy/ship.sh user@ip-addr --with-ai                 embed the default model (llama3.2:3b)
 #   OLLAMA_MODEL=llama3.2:3b ./deploy/ship.sh ... --with-ai  embed a larger model
 #
 #   Without --with-ai the assistant image is not built/shipped and the chat
@@ -31,15 +31,15 @@
 # What it does:
 #   1. Builds Docker images on your local machine
 #   2. Saves them to deploy/sabc-images.tar.gz (~200MB compressed)
-#   3. Transfers the archive + compose file + .env to the EC2 instance
+#   3. Transfers the archive + compose file + .env to the Server instance
 #   4. Loads images and starts the platform with docker compose
 #   5. Auto-migrates a legacy SQLite database to PostgreSQL on first deploy
 #      (runs once, before the backend boots; a marker file skips it thereafter)
 #
 # Prerequisites:
 #   - Docker + Docker Compose on your local machine
-#   - SSH access to the EC2 instance (key-based recommended)
-#   - EC2 security group: inbound port 80 (HTTP), port 22 (SSH)
+#   - SSH access to the Server instance (key-based recommended)
+#   - Server security group: inbound port 80 (HTTP), port 22 (SSH)
 #
 # ═══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -87,7 +87,7 @@ if [[ "$BACKEND_ONLY" == true && "$FRONTEND_ONLY" == true ]]; then
 fi
 
 if [[ -z "$TARGET" && "$BUILD_ONLY" == false && "$BUNDLE" == false ]]; then
-  echo "Usage: ./deploy/ship.sh user@ec2-ip [--setup|--update|--deploy-only|--rollback|--build-only|--bundle] [--with-ai] [--backend-only|--frontend-only]"
+  echo "Usage: ./deploy/ship.sh user@ip-addr [--setup|--update|--deploy-only|--rollback|--build-only|--bundle] [--with-ai] [--backend-only|--frontend-only]"
   exit 1
 fi
 
@@ -271,8 +271,8 @@ save_images() {
   ok "Archive ready: $ARCHIVE ($size)"
 }
 
-# ── Step 3: Install Docker on EC2 (first time only) ─────────────────────────
-setup_ec2() {
+# ── Step 3: Install Docker on Server (first time only) ─────────────────────────
+setup_server() {
   info "Installing Docker on $TARGET ..."
   remote "sudo bash -s" << 'SETUP_EOF'
 set -e
@@ -337,7 +337,7 @@ SETUP_EOF
   ok "Docker ready on $TARGET"
 }
 
-# ── Step 4: Transfer files to EC2 ───────────────────────────────────────────
+# ── Step 4: Transfer files to Server ───────────────────────────────────────────
 transfer() {
   info "Creating remote directory $REMOTE_DIR ..."
   remote "sudo mkdir -p $REMOTE_DIR && sudo chown \$(whoami):\$(whoami) $REMOTE_DIR"
@@ -352,11 +352,11 @@ transfer() {
   if [ -f "$PROJECT_DIR/.env" ]; then
     scp -o StrictHostKeyChecking=no "$PROJECT_DIR/.env" "$TARGET:$REMOTE_DIR/"
   else
-    info "No .env found locally — creating default on EC2 ..."
+    info "No .env found locally — creating default on Server ..."
     remote "cat > $REMOTE_DIR/.env" << 'ENV_EOF'
 HTTPS_PORT=8443
 BACKEND_PORT=3000
-# Set to the EC2 private IP so the bootstrap curl command works
+# Set to the Server private IP so the bootstrap curl command works
 # HOST_IP=10.0.x.x
 ENV_EOF
   fi
@@ -674,8 +674,8 @@ DEPLOY_EOF
   echo "  CRICLO Platform is running on:"
   echo ""
 
-  # Detect the public IP of the EC2 instance.
-  # Modern EC2 instances require IMDSv2 (token-based); a plain IMDSv1 curl
+  # Detect the public IP of the Server instance.
+  # Modern Server instances require IMDSv2 (token-based); a plain IMDSv1 curl
   # returns a 401 with an empty body which leaves pub_ip blank.
   local pub_ip
   pub_ip=$(remote 'bash -s' << 'IPEOF' 2>/dev/null
@@ -805,7 +805,7 @@ if [[ "$BACKEND_ONLY" == true || "$FRONTEND_ONLY" == true ]]; then
     exit 0
   fi
 
-  if [[ "$DO_SETUP" == true ]]; then setup_ec2; fi
+  if [[ "$DO_SETUP" == true ]]; then setup_server; fi
   build_images
   save_images
   transfer
@@ -818,7 +818,7 @@ if [[ "$BUILD_ONLY" == true || "$BUNDLE" == true ]]; then
   save_images
   echo ""
   info "Archive at: $ARCHIVE"
-  info "Transfer manually:  scp $ARCHIVE user@ec2-ip:$REMOTE_DIR/"
+  info "Transfer manually:  scp $ARCHIVE user@ip-addr:$REMOTE_DIR/"
   exit 0
 fi
 
@@ -852,7 +852,7 @@ fi
 
 # Full deploy
 if [[ "$DO_SETUP" == true ]]; then
-  setup_ec2
+  setup_server
 fi
 
 build_images
